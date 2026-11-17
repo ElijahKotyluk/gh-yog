@@ -1,0 +1,3138 @@
+#!/usr/bin/env python3
+"""yog: a review brief for a pull request, written before a human reads it.
+
+Plain code computes the facts: every changed unit of the diff, red flags, test
+file pairing, dependency changes and the claims made in the PR text. An AI agent
+then groups the change by concern, answers every claim, ranks risk with
+citations and lists questions. `check` recomputes the facts from git and refuses
+any brief that leaves a change unassigned, ranks a hard-flagged change below
+high, or cites lines that are not in the diff.
+
+Works in any git checkout with an authenticated GitHub CLI (gh). No dependencies
+beyond python3 (3.8+), git and gh. Not tied to any AI agent. Writes nothing to
+GitHub.
+
+The same file ships two ways, and each works without the other:
+  - the gh-yog GitHub CLI extension, run as `gh yog`
+    https://github.com/ElijahKotyluk/gh-yog (source of truth)
+  - bundled with the yog agent skill, run as `scripts/yog`
+    https://github.com/ElijahKotyluk/yog
+
+Subcommands:
+  collect   fetch a PR (or take local commits), compute the facts, write a brief template
+  facts     print the computed facts, no AI involved
+  hunks     print units of the diff with line numbers, for reading
+  show      print a file at the PR's head (or base) commit with line numbers
+  check     recompute the facts and validate a brief
+  render    check a brief, then print it for a human
+
+Run with `<subcommand> --help` for details.
+"""
+
+import argparse
+import fnmatch
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import unicodedata
+import urllib.parse
+
+VERSION = "0.1.0"
+FACTS_SCHEMA = 1
+BRIEF_SCHEMA = 1
+
+CHUNK_LINES = 80          # hunks longer than this are split into chunks for coverage
+CITE_SLACK = 3            # a citation may point this many lines outside its unit
+MAX_GROUPS = 12
+LARGE_PR_LINES = 1500     # non-mechanical changed lines that make a PR "large"
+SHARE_MIN_LINES = 300     # the one-group share rule applies from this many lines...
+SHARE_MIN_FILES = 4       # ...and this many non-mechanical files
+SHARE_MAX = 0.6
+MAX_CLAIMS = 30
+MAX_CLAIM_CHARS = 300
+LONG_LINE = 500
+RISKS = ("high", "medium", "low")
+RISK_RANK = {"high": 3, "medium": 2, "low": 1}
+CLAIM_STATUSES = ("matches", "partial", "not_found", "contradicted", "not_a_claim")
+TEST_STATUSES = ("covered", "partial", "none", "n/a")
+LIMITS = {
+    "summary": 700, "title": 80, "intent": 200, "why": 400, "tests_note": 250,
+    "question": 300, "undisclosed": 250, "reason": 200, "allow_large_group": 200,
+}
+MAX_SUMMARY_SENTENCES = 4
+MAX_QUESTIONS = 5
+MAX_UNDISCLOSED = 10
+
+PR_URL_RE = re.compile(r"https?://([^/\s]+)/([^/\s]+)/([^/\s]+)/pull/(\d+)")
+SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def command_name():
+    """How to refer to this tool in hints: `gh yog` for the extension, else the path used."""
+    invoked = sys.argv[0] if sys.argv and sys.argv[0] else "yog"
+    base = os.path.basename(invoked)
+    if base == "gh-yog":
+        return "gh yog"
+    if base == "yog":
+        return shlex.quote(invoked)
+    return "yog"
+
+
+class YogError(Exception):
+    """A failure to report to the user. Carries an exit code."""
+
+    def __init__(self, msg, code=1):
+        Exception.__init__(self, msg)
+        self.code = code
+
+
+def die(msg, code=1):
+    raise YogError(msg, code)
+
+
+# ---------------------------------------------------------------------------
+# gh
+
+def gh(args, stdin=None):
+    try:
+        proc = subprocess.run(["gh"] + args, input=stdin, capture_output=True, text=True)
+    except FileNotFoundError:
+        die("gh not found. Install the GitHub CLI (https://cli.github.com) and run `gh auth login`.")
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout).strip()
+        die("`gh %s` failed:\n%s" % (" ".join(args[:2]), err))
+    return proc.stdout
+
+
+def gh_json(args):
+    return json.loads(gh(args))
+
+
+def split_repo(value):
+    if not value or "/" not in value:
+        die("--repo must look like OWNER/NAME")
+    owner, name = value.split("/", 1)
+    if not SAFE_NAME_RE.match(owner) or not SAFE_NAME_RE.match(name):
+        die("--repo must look like OWNER/NAME")
+    return owner, name
+
+
+def resolve_pr(pr_arg, repo_flag):
+    """Return (host, owner, repo, number) from a URL, a number, or the current branch."""
+    if pr_arg:
+        match = PR_URL_RE.search(pr_arg)
+        if match:
+            return match.group(1), match.group(2), match.group(3), int(match.group(4))
+        if pr_arg.lstrip("#").isdigit():
+            number = int(pr_arg.lstrip("#"))
+            if repo_flag:
+                owner, repo = split_repo(repo_flag)
+                args = ["repo", "view", "%s/%s" % (owner, repo), "--json", "url", "--jq", ".url"]
+            else:
+                args = ["repo", "view", "--json", "url", "--jq", ".url"]
+            url = gh(args).strip()
+            match = re.match(r"https?://([^/\s]+)/([^/\s]+)/([^/\s]+)", url)
+            if not match:
+                die("could not work out the repository; pass --repo OWNER/NAME")
+            return match.group(1), match.group(2), match.group(3), number
+        die("could not parse PR %r (give a number or a GitHub PR URL)" % pr_arg)
+    args = ["pr", "view", "--json", "url", "--jq", ".url"]
+    if repo_flag:
+        args += ["--repo", repo_flag]
+    url = gh(args).strip()
+    match = PR_URL_RE.search(url)
+    if not match:
+        die("no pull request found for the current branch; pass a PR number or URL")
+    return match.group(1), match.group(2), match.group(3), int(match.group(4))
+
+
+PR_FIELDS = (
+    "number,title,body,state,isDraft,url,author,baseRefName,baseRefOid,"
+    "headRefName,headRefOid,commits"
+)
+
+
+def fetch_pr_meta(host, owner, repo, number):
+    args = ["pr", "view", str(number), "--repo", "%s/%s/%s" % (host, owner, repo), "--json", PR_FIELDS]
+    data = gh_json(args)
+    commits = data.get("commits") or []
+    return {
+        "host": host, "owner": owner, "repo": repo, "number": number,
+        "url": data.get("url") or "", "title": data.get("title") or "",
+        "body": data.get("body") or "", "state": data.get("state") or "",
+        "draft": bool(data.get("isDraft")),
+        "author": ((data.get("author") or {}).get("login") or ""),
+        "base_ref": data.get("baseRefName") or "", "base_oid": data.get("baseRefOid") or "",
+        "head_ref": data.get("headRefName") or "", "head_oid": data.get("headRefOid") or "",
+        "commit_subjects": [full_subject(c) for c in commits],
+    }
+
+
+def full_subject(commit):
+    """GitHub cuts long subjects into headline + body at an ellipsis; join them back."""
+    head = commit.get("messageHeadline") or ""
+    body = commit.get("messageBody") or ""
+    if head.endswith("\u2026") and body.startswith("\u2026"):
+        return head[:-1] + body[1:].split("\n", 1)[0]
+    return head
+
+
+def api_merge_base(meta, base_oid, head_oid):
+    path = "repos/%s/%s/compare/%s...%s" % (meta["owner"], meta["repo"], base_oid, head_oid)
+    args = ["api", path, "--jq", ".merge_base_commit.sha"]
+    if meta["host"] != "github.com":
+        args = ["api", "--hostname", meta["host"], path, "--jq", ".merge_base_commit.sha"]
+    sha = gh(args).strip()
+    if not re.match(r"^[0-9a-f]{40,64}$", sha):
+        die("GitHub did not return a merge base for this PR")
+    return sha
+
+
+# ---------------------------------------------------------------------------
+# git, with every setting that changes diff output pinned
+
+GIT_PINS = [
+    "-c", "core.quotepath=off",
+    "-c", "diff.noprefix=false",
+    "-c", "diff.mnemonicPrefix=false",
+    "-c", "diff.relative=false",
+    "-c", "diff.interHunkContext=0",
+    "-c", "diff.suppressBlankEmpty=false",
+    "-c", "diff.ignoreSubmodules=none",
+    "-c", "diff.orderFile=" + os.devnull,
+    "-c", "color.ui=never",
+    "-c", "color.diff=never",
+    "-c", "core.attributesFile=" + os.devnull,
+    "-c", "log.showSignature=false",
+    "-c", "core.fsmonitor=false",
+]
+DIFF_FLAGS = [
+    "--no-ext-diff", "--no-textconv", "--no-color", "--no-relative",
+    "--diff-algorithm=myers", "--indent-heuristic", "--ignore-submodules=none",
+    "--src-prefix=a/", "--dst-prefix=b/",
+]
+GIT_ENV_DROP = ("GIT_EXTERNAL_DIFF", "GIT_DIFF_OPTS", "GIT_DIFF_PATH_COUNTER", "GIT_DIFF_PATH_TOTAL")
+
+
+def git_env():
+    env = dict(os.environ)
+    for key in GIT_ENV_DROP:
+        env.pop(key, None)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_LITERAL_PATHSPECS"] = "1"
+    env["GIT_NO_REPLACE_OBJECTS"] = "1"
+    env["LC_ALL"] = "C"
+    return env
+
+
+def git(args, check=True, quiet=False):
+    """Run git with pinned settings. Returns stdout as bytes."""
+    try:
+        proc = subprocess.run(["git"] + GIT_PINS + args, capture_output=True, env=git_env())
+    except FileNotFoundError:
+        die("git not found")
+    if check and proc.returncode != 0:
+        if quiet:
+            return None
+        err = proc.stderr.decode("utf-8", "replace").strip()
+        die("`git %s` failed:\n%s" % (" ".join(args[:2]), err))
+    if proc.returncode != 0:
+        return None
+    return proc.stdout
+
+
+def text(data):
+    """Decode git output. Undecodable bytes become lone surrogates, which the hidden-text
+    check reports and `clean` escapes, so nothing is silently dropped."""
+    return data.decode("utf-8", "surrogateescape")
+
+
+def git_version():
+    out = text(git(["--version"])).strip()
+    match = re.search(r"(\d+)\.(\d+)", out)
+    return (int(match.group(1)), int(match.group(2))) if match else (0, 0)
+
+
+def rev(ref):
+    out = git(["rev-parse", "--verify", "--quiet", ref + "^{commit}"], check=False)
+    return text(out).strip() if out else None
+
+
+def is_shallow():
+    out = git(["rev-parse", "--is-shallow-repository"], check=False)
+    return bool(out) and text(out).strip() == "true"
+
+
+def git_dir():
+    out = git(["rev-parse", "--absolute-git-dir"], check=False)
+    return text(out).strip() if out else None
+
+
+def read_blob(sha):
+    return git(["cat-file", "blob", sha])
+
+
+class BlobReader(object):
+    """Read many blobs through one `git cat-file --batch` process."""
+
+    def __init__(self):
+        self.proc = subprocess.Popen(["git"] + GIT_PINS + ["cat-file", "--batch"], stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=git_env())
+        self.cache = {}
+
+    def read(self, sha):
+        if sha in self.cache:
+            return self.cache[sha]
+        self.proc.stdin.write(sha.encode("ascii") + b"\n")
+        self.proc.stdin.flush()
+        header = self.proc.stdout.readline().split()
+        if len(header) != 3 or header[1] != b"blob":
+            die("cannot read blob %s" % sha)
+        size = int(header[2])
+        data = self.proc.stdout.read(size)
+        self.proc.stdout.read(1)
+        self.cache[sha] = data
+        return data
+
+    def close(self):
+        try:
+            self.proc.stdin.close()
+            self.proc.wait(timeout=10)
+        except Exception:
+            self.proc.kill()
+
+
+def read_path(commit, path):
+    """File content at a commit, or None if the path is not a file there."""
+    spec = "%s:%s" % (commit, path)
+    kind = git(["cat-file", "-t", spec], check=False)
+    if not kind or text(kind).strip() != "blob":
+        return None
+    return git(["cat-file", "blob", spec])
+
+
+def list_tree(commit):
+    out = git(["ls-tree", "-r", "-z", "--full-tree", "--name-only", commit])
+    return [p for p in text(out).split("\0") if p]
+
+
+def merge_base_local(a, b):
+    out = git(["merge-base", a, b], check=False)
+    return text(out).strip() if out else None
+
+
+# ---------------------------------------------------------------------------
+# text safety
+#
+# Allowed: letters, digits, punctuation and symbols (except the blank ones below), the
+# ordinary space and no-break space, newline and tab, up to MAX_MARKS combining marks on a
+# visible character, one emoji variation selector right after a visible character, and the
+# three subdivision flag emoji. Everything else is reported, including control, format,
+# private-use, unassigned and surrogate code points, other spaces and zero-width characters.
+ALLOWED_SPACES = set([0x20, 0xA0])
+BLANK_CHARS = set([0x115F, 0x1160, 0x2800, 0x3164, 0xFFA0])
+INVISIBLE_MARKS = set([0x034F, 0x17B4, 0x17B5, 0x180B, 0x180C, 0x180D, 0x180F])
+EMOJI_SELECTORS = set([0xFE0E, 0xFE0F])
+VARIATION_SELECTORS = set(range(0xFE00, 0xFE10)) | set(range(0xE0100, 0xE01F0))
+MAX_MARKS = 3
+TAG_FLAG_BASE = 0x1F3F4
+FLAG_TAGS = [
+    "".join(chr(0xE0000 + ord(c)) for c in name) + chr(0xE007F) for name in ("gbeng", "gbsct", "gbwls")
+]
+ZWJ = 0x200D
+
+
+def hidden_positions(s, allow_emoji_zwj=False):
+    """Indexes of characters in s that are not on the allowlist."""
+    bad, i, prev, marks = [], 0, None, 0
+    while i < len(s):
+        ch = s[i]
+        cp = ord(ch)
+        category = unicodedata.category(ch)
+        if ch in "\n\t" or cp in ALLOWED_SPACES:
+            prev, marks = None, 0
+            i += 1
+            continue
+        if cp == TAG_FLAG_BASE:
+            tail = next((t for t in FLAG_TAGS if s.startswith(t, i + 1)), "")
+            prev, marks = "base", 0
+            i += 1 + len(tail)
+            continue
+        if (
+            allow_emoji_zwj and cp == ZWJ and i > 0 and i + 1 < len(s)
+            and unicodedata.category(s[i - 1]) in ("So", "Mn") and unicodedata.category(s[i + 1]) == "So"
+        ):
+            kind = "selector"
+        elif category[0] in "LNPS" and cp not in BLANK_CHARS:
+            kind = "base"
+        elif cp in EMOJI_SELECTORS and prev == "base":
+            kind = "selector"
+        elif (
+            category[0] == "M"
+            and cp not in INVISIBLE_MARKS
+            and cp not in VARIATION_SELECTORS
+            and prev in ("base", "selector", "mark")
+            and marks < MAX_MARKS
+        ):
+            kind = "mark"
+        else:
+            kind = None
+            bad.append(i)
+        marks = marks + 1 if kind == "mark" else 0
+        prev = kind
+        i += 1
+    return bad
+
+
+def unsafe_chars(s):
+    return [s[i] for i in hidden_positions(s)]
+
+
+def escape_char(ch):
+    return "\\u%04x" % ord(ch) if ord(ch) <= 0xFFFF else "\\U%08x" % ord(ch)
+
+
+def clean(s):
+    """Make third-party text safe to print: escape every character outside the allowlist."""
+    s = (s or "").replace("\r\n", "\n")
+    bad = set(hidden_positions(s))
+    return "".join(escape_char(ch) if i in bad else ch for i, ch in enumerate(s))
+
+
+def clean_line(s):
+    return clean(s).replace("\n", "\\n").replace("\t", "\\t")
+
+
+def char_codes(chars):
+    return ", ".join(sorted(set("U+%04X" % ord(ch) for ch in chars)))
+
+
+def safe_name(*parts):
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", "-".join(str(p) for p in parts).lower())
+
+
+# ---------------------------------------------------------------------------
+# diff model
+#
+# A PR is diffed from its merge base to its head, which is what GitHub shows. The file
+# list comes from `git diff --raw -z`; each changed text file is then diffed blob to blob,
+# so no path is ever parsed out of a patch header.
+
+NULL_SHA_RE = re.compile(r"^0+$")
+HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+MODE_FILE = ("100644", "100755")
+MODE_LINK = "120000"
+MODE_SUBMODULE = "160000"
+
+
+def raw_changes(base, head):
+    """Changed files between two commits, renames detected, sorted by path."""
+    out = git(
+        ["diff", "--raw", "-z", "--no-abbrev", "-M50%", "-l100000"] + DIFF_FLAGS + [base, head]
+    )
+    fields = text(out).split("\0")
+    changes, i = [], 0
+    while i < len(fields):
+        meta = fields[i]
+        if not meta:
+            i += 1
+            continue
+        if not meta.startswith(":"):
+            die("unexpected git diff --raw output")
+        parts = meta[1:].split(" ")
+        old_mode, new_mode, old_blob, new_blob, status = parts[0], parts[1], parts[2], parts[3], parts[4]
+        letter = status[0]
+        if letter in "RC":
+            old_path, new_path = fields[i + 1], fields[i + 2]
+            i += 3
+        else:
+            old_path = new_path = fields[i + 1]
+            i += 2
+        changes.append({
+            "status": letter,
+            "similarity": int(status[1:]) if len(status) > 1 and status[1:].isdigit() else None,
+            "old_path": None if letter == "A" else old_path,
+            "path": None if letter == "D" else new_path,
+            "old_mode": None if NULL_SHA_RE.match(old_mode) else old_mode,
+            "new_mode": None if NULL_SHA_RE.match(new_mode) else new_mode,
+            "old_blob": None if NULL_SHA_RE.match(old_blob) else old_blob,
+            "new_blob": None if NULL_SHA_RE.match(new_blob) else new_blob,
+        })
+    changes.sort(key=lambda c: (c["path"] or c["old_path"]))
+    return changes
+
+
+def looks_binary(data):
+    """git's own heuristic: a NUL byte in the first 8000 bytes."""
+    return b"\0" in data[:8000]
+
+
+def blob_kind(mode):
+    if mode == MODE_SUBMODULE:
+        return "submodule"
+    if mode == MODE_LINK:
+        return "symlink"
+    if mode in MODE_FILE:
+        return "file"
+    return None
+
+
+def split_lines(data):
+    lines = text(data).split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return [l[:-1] if l.endswith("\r") else l for l in lines]
+
+
+def parse_hunks(patch):
+    """Hunks from a unified diff: each a list of (kind, old_no, new_no, text)."""
+    hunks, current, old_no, new_no = [], None, 0, 0
+    for raw in text(patch).split("\n"):
+        match = HUNK_RE.match(raw)
+        if match:
+            current = []
+            hunks.append(current)
+            old_no, new_no = int(match.group(1)), int(match.group(3))
+            continue
+        if current is None or not raw or raw.startswith("\\"):
+            continue
+        line = raw[1:]
+        if line.endswith("\r"):
+            line = line[:-1]
+        if raw[0] == "+":
+            current.append(("+", None, new_no, line))
+            new_no += 1
+        elif raw[0] == "-":
+            current.append(("-", old_no, None, line))
+            old_no += 1
+        elif raw[0] == " ":
+            current.append((" ", old_no, new_no, line))
+            old_no += 1
+            new_no += 1
+    return [h for h in hunks if h]
+
+
+def file_hunks(change, old_data, new_data):
+    """Text hunks for one file change (empty for binaries, submodules, mode-only changes)."""
+    if old_data is None and new_data is None:
+        return []
+    if old_data is None:
+        return [[("+", None, n, l) for n, l in enumerate(split_lines(new_data), 1)]] if new_data else []
+    if new_data is None:
+        return [[("-", n, None, l) for n, l in enumerate(split_lines(old_data), 1)]] if old_data else []
+    if change["old_blob"] == change["new_blob"]:
+        return []
+    patch = git(["diff", "-a", "-U3"] + DIFF_FLAGS + [change["old_blob"], change["new_blob"]])
+    return parse_hunks(patch)
+
+
+def line_range(lines, side):
+    nums = [l[1] if side == "base" else l[2] for l in lines]
+    nums = [n for n in nums if n is not None]
+    return [min(nums), max(nums)] if nums else None
+
+
+def make_units(index, hunks, splittable=True):
+    """Coverage units for one file: F.0 always, then F.H per hunk, F.H.C per chunk."""
+    units = [{"id": "%d.0" % index, "file": index, "kind": "file", "lines": [],
+              "head": None, "base": None, "added": 0, "removed": 0}]
+    for h, lines in enumerate(hunks, 1):
+        if splittable and len(lines) > CHUNK_LINES:
+            pieces = [lines[i:i + CHUNK_LINES] for i in range(0, len(lines), CHUNK_LINES)]
+            ids = ["%d.%d.%d" % (index, h, c) for c in range(1, len(pieces) + 1)]
+        else:
+            pieces, ids = [lines], ["%d.%d" % (index, h)]
+        for uid, piece in zip(ids, pieces):
+            units.append({
+                "id": uid, "file": index, "kind": "hunk", "lines": piece,
+                "head": line_range(piece, "head"), "base": line_range(piece, "base"),
+                "added": sum(1 for l in piece if l[0] == "+"),
+                "removed": sum(1 for l in piece if l[0] == "-"),
+            })
+    return units
+
+
+# ---------------------------------------------------------------------------
+# paths, globs and policy
+
+def glob_regex(pattern):
+    """Translate a glob to a regex. `**/` matches any directories, `*` stays in one segment.
+    Patterns are anchored at the repository root."""
+    out, i = [], 0
+    while i < len(pattern):
+        if pattern.startswith("**/", i):
+            out.append("(?:.*/)?")
+            i += 3
+        elif pattern.startswith("/**", i) and i + 3 == len(pattern):
+            out.append("/.*")
+            i += 3
+        elif pattern.startswith("**", i):
+            out.append(".*")
+            i += 2
+        elif pattern[i] == "*":
+            out.append("[^/]*")
+            i += 1
+        elif pattern[i] == "?":
+            out.append("[^/]")
+            i += 1
+        elif pattern[i] == "[":
+            end = pattern.find("]", i + 1)
+            if end == -1:
+                out.append(re.escape("["))
+                i += 1
+            else:
+                body = pattern[i + 1:end]
+                if body.startswith("!"):
+                    body = "^" + body[1:]
+                out.append("[" + body.replace("\\", "\\\\") + "]")
+                i = end + 1
+        else:
+            out.append(re.escape(pattern[i]))
+            i += 1
+    try:
+        return re.compile("^" + "".join(out) + "$")
+    except re.error:
+        return re.compile("^" + re.escape(pattern) + "$")
+
+
+_GLOB_CACHE = {}
+
+
+def glob_match(pattern, path):
+    rx = _GLOB_CACHE.get(pattern)
+    if rx is None:
+        rx = _GLOB_CACHE[pattern] = glob_regex(pattern)
+    return bool(rx.match(path))
+
+
+def any_glob(patterns, path):
+    return bool(path) and any(glob_match(p, path) for p in patterns)
+
+
+def gitattributes_pattern(directory, pattern):
+    """A .gitattributes pattern as a root-anchored glob."""
+    anchored = "/" in pattern.rstrip("/")
+    pattern = pattern.lstrip("/")
+    prefix = (directory + "/") if directory else ""
+    return prefix + (pattern if anchored else "**/" + pattern)
+
+
+def load_generated_attributes(commit, tree):
+    """(glob, value) pairs for linguist-generated, in the order git applies them."""
+    files = sorted((p for p in tree if p == ".gitattributes" or p.endswith("/.gitattributes")),
+                   key=lambda p: (p.count("/"), p))
+    rules = []
+    for path in files:
+        data = read_path(commit, path)
+        if data is None:
+            continue
+        directory = os.path.dirname(path)
+        for line in text(data).splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or line.startswith("[attr]"):
+                continue
+            parts = line.split()
+            pattern, attrs = parts[0], parts[1:]
+            for attr in attrs:
+                name = attr.lstrip("-!").split("=", 1)[0]
+                if name != "linguist-generated":
+                    continue
+                if attr.startswith("-") or attr.startswith("!") or attr.endswith("=false"):
+                    value = False
+                else:
+                    value = True
+                rules.append((gitattributes_pattern(directory, pattern), value))
+    return rules
+
+
+def attribute_generated(rules, path):
+    value = False
+    for pattern, v in rules:
+        if glob_match(pattern, path):
+            value = v
+    return value
+
+
+CONFIG_PATH = ".github/yog.json"
+
+
+def load_config(commit):
+    """Repo policy from the base branch tip: never from the PR's head."""
+    config = {"sensitive": [], "generated": [], "registries": [], "problems": []}
+    data = read_path(commit, CONFIG_PATH)
+    if data is None:
+        return config
+    try:
+        raw = json.loads(text(data))
+    except ValueError:
+        config["problems"].append("%s on the base branch is not valid JSON; ignored" % CONFIG_PATH)
+        return config
+    if not isinstance(raw, dict):
+        config["problems"].append("%s on the base branch is not a JSON object; ignored" % CONFIG_PATH)
+        return config
+    for key in ("sensitive", "generated", "registries"):
+        value = raw.get(key, [])
+        if not isinstance(value, list) or not all(isinstance(v, str) and v for v in value):
+            config["problems"].append("%s: %r must be a list of strings; ignored" % (CONFIG_PATH, key))
+            continue
+        config[key] = value if key == "registries" else [g for v in value for g in policy_globs(v)]
+    tree = None
+    for key in ("sensitive", "generated"):
+        for v in raw.get(key, []) if isinstance(raw.get(key), list) else []:
+            if not isinstance(v, str):
+                continue
+            if tree is None:
+                tree = list_tree(commit)
+            if not any(any_glob(policy_globs(v), p) for p in tree):
+                config["problems"].append("%s: %s glob %r matches no file on the base branch" % (CONFIG_PATH, key, v))
+    return config
+
+
+def policy_globs(pattern):
+    """A repo-policy glob in the forms people write: leading / anchors, trailing / means
+    a folder, a bare name matches that file or folder anywhere."""
+    p = pattern.strip()
+    anchored = p.startswith("/")
+    folder = p.endswith("/")
+    p = p.strip("/")
+    if folder:
+        return [p + "/**"] if anchored or "/" in p else ["**/" + p + "/**"]
+    if not anchored and "/" not in p:
+        return ["**/" + p, "**/" + p + "/**"]
+    return [p, p + "/**"] if not p.endswith("**") else [p]
+
+
+# ---------------------------------------------------------------------------
+# classes
+
+LOCKFILES = set([
+    "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", "bun.lockb",
+    "bun.lock", "Cargo.lock", "poetry.lock", "Pipfile.lock", "uv.lock", "pdm.lock", "go.sum",
+    "Gemfile.lock", "composer.lock", "packages.lock.json", "flake.lock", "pubspec.lock",
+    "mix.lock", "Podfile.lock", "gradle.lockfile", "Package.resolved", "deno.lock",
+])
+MANIFESTS = set([
+    "package.json", "pyproject.toml", "setup.py", "setup.cfg", "Pipfile", "Cargo.toml",
+    "go.mod", "Gemfile", "composer.json", "build.gradle", "build.gradle.kts", "pom.xml",
+    "pubspec.yaml", "mix.exs", "Package.swift", "deno.json", "deno.jsonc", "pnpm-workspace.yaml",
+])
+MANIFEST_GLOBS = ["**/*requirements*.txt", "**/requirements/*.txt", "**/constraints*.txt", "**/*.csproj",
+                  "**/*.gemspec"]
+CI_GLOBS = [
+    ".github/workflows/**", ".github/actions/**", "**/action.yml", "**/action.yaml",
+    ".gitlab-ci.yml", ".gitlab/ci/**", ".circleci/**", "azure-pipelines.yml",
+    ".azure-pipelines/**", "**/Jenkinsfile", ".travis.yml", "bitbucket-pipelines.yml",
+    ".buildkite/**", ".drone.yml", "cloudbuild.yaml", "cloudbuild.yml", "**/Dockerfile",
+    "**/Dockerfile.*", "**/*.dockerfile", "**/docker-compose*.yml", "**/docker-compose*.yaml",
+    "**/compose.yml", "**/compose.yaml", ".github/dependabot.yml", "renovate.json",
+    ".github/renovate.json", ".woodpecker.yml", ".woodpecker/**",
+]
+LOCAL_EXEC_GLOBS = [
+    ".husky/**", ".pre-commit-config.yaml", ".devcontainer/**", ".vscode/tasks.json",
+    ".vscode/settings.json", ".vscode/launch.json", ".envrc", "**/*.pth", "**/sitecustomize.py",
+    "**/usercustomize.py", ".githooks/**", ".git-hooks/**", "lefthook.yml", ".lefthook.yml",
+    "lefthook.yaml", "**/.pnpmfile.cjs", "**/.pnpmfile.js", ".idea/runConfigurations/**",
+]
+REGISTRY_GLOBS = [
+    "**/.npmrc", "**/.yarnrc", "**/.yarnrc.yml", "**/.pypirc", "**/pip.conf", "**/pip.ini",
+    "**/.cargo/config", "**/.cargo/config.toml", "**/nuget.config", "**/NuGet.Config",
+    "**/bunfig.toml", "**/.bunfig.toml", "**/.gemrc", "**/.condarc",
+]
+REVIEW_SURFACE_GLOBS = [
+    "**/.gitattributes", "CODEOWNERS", ".github/CODEOWNERS", "docs/CODEOWNERS",
+    ".gitmodules", CONFIG_PATH,
+]
+SENSITIVE_GLOBS = (
+    CI_GLOBS + LOCAL_EXEC_GLOBS + REGISTRY_GLOBS + REVIEW_SURFACE_GLOBS + [
+        "**/migrations/**", "**/migrate/**", "**/alembic/**", "**/bin/**", "**/conftest.py",
+        "**/setup.py", "**/Makefile", "**/*.sh",
+    ]
+)
+EXEC_HINT_GLOBS = ["**/bin/**", "**/*.sh", "**/Makefile", "**/setup.py", "**/conftest.py",
+                   "**/__main__.py", "**/scripts/**"]
+MIGRATION_GLOBS = ["**/migrations/**", "**/migrate/**", "**/alembic/**", "**/*.sql"]
+TEST_DIRS = set(["test", "tests", "__tests__", "spec", "specs", "testing", "e2e", "__mocks__", "testdata"])
+TEST_NAME_RE = re.compile(
+    r"(^test_.*\.py$)|(_test\.(go|py|rb|exs?|dart)$)|(\.(test|spec)\.[a-z0-9]+$)|"
+    r"(_spec\.rb$)|(^conftest\.py$)|((Test|Tests|Spec|IT)\.(java|kt|cs|scala|swift)$)"
+)
+DOC_NAMES = set(["LICENSE", "LICENCE", "NOTICE", "AUTHORS", "CHANGELOG", "CONTRIBUTORS"])
+ASSET_EXT = set([
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".ico", ".bmp", ".tif", ".tiff", ".heic",
+    ".woff", ".woff2", ".ttf", ".otf", ".eot", ".mp3", ".mp4", ".wav", ".ogg", ".webm", ".mov",
+    ".m4a", ".flac", ".pdf",
+])
+CODE_EXT = set([
+    ".sh", ".bash", ".zsh", ".py", ".js", ".mjs", ".cjs", ".ts", ".mts", ".cts", ".jsx", ".tsx",
+    ".rb", ".pl", ".php", ".ps1", ".bat", ".cmd", ".exe", ".go", ".rs", ".java", ".kt", ".cs",
+    ".lua", ".vbs", ".jar", ".so", ".dll", ".dylib", ".node", ".wasm",
+])
+GENERATED_NAME_GLOBS = ["**/*.generated.*", "**/*.min.js", "**/*.min.css", "**/*.min.mjs", "**/*.js.map", "**/*.css.map",
+                        "**/__snapshots__/**", "**/*.snap"]
+GENERATED_MARKER_RE = re.compile(
+    r"^\s*(?://|#|/\*+|\*|<!--|--|;+|%|\(\*)\s*(?:"
+    r"@generated\b|<auto-generated|"
+    r".*\b(?:[Gg]enerated|GENERATED|[Aa]uto-?generated)\b.*\bDO NOT EDIT\b|"
+    r".*\bDO NOT EDIT\b.*\b(?:[Gg]enerated|GENERATED)\b)", re.MULTILINE)
+
+
+def is_lockfile(path):
+    return os.path.basename(path) in LOCKFILES
+
+
+def is_manifest(path):
+    return os.path.basename(path) in MANIFESTS or any_glob(MANIFEST_GLOBS, path)
+
+
+def is_test_path(path):
+    parts = path.split("/")
+    return bool(TEST_DIRS.intersection(parts[:-1])) or bool(TEST_NAME_RE.search(parts[-1]))
+
+
+CONFIG_EXT = set([".json", ".jsonc", ".json5", ".yml", ".yaml", ".toml", ".ini", ".cfg", ".conf",
+                  ".properties", ".env", ".editorconfig", ".plist", ".xml"])
+CONFIG_NAME_RE = re.compile(r"(^\.)|(\.config\.[a-z0-9]+$)")
+
+
+def is_config_path(path):
+    base = os.path.basename(path)
+    return os.path.splitext(base)[1].lower() in CONFIG_EXT or bool(CONFIG_NAME_RE.search(base))
+
+
+def is_doc_path(path):
+    base = os.path.basename(path)
+    stem, ext = os.path.splitext(base)
+    ext = ext.lower()
+    if ext in CODE_EXT or ext in CONFIG_EXT:
+        return False
+    if ext in (".md", ".rst", ".adoc"):
+        return True
+    if stem.upper() in DOC_NAMES and ext in ("", ".txt"):
+        return True
+    return ext == ".txt" and base not in ("CMakeLists.txt",) and not is_manifest(path)
+
+
+def classify(path, binary):
+    if binary:
+        ext = os.path.splitext(path)[1].lower()
+        return "asset" if ext in ASSET_EXT else "binary"
+    if is_lockfile(path):
+        return "lockfile"
+    if any_glob(CI_GLOBS, path):
+        return "ci"
+    if is_manifest(path):
+        return "manifest"
+    if is_test_path(path):
+        return "test"
+    if is_doc_path(path):
+        return "docs"
+    if is_config_path(path):
+        return "config"
+    return "source"
+
+
+def has_generated_marker(data):
+    if data is None:
+        return False
+    head = "\n".join(split_lines(data[:4000])[:10])
+    return bool(GENERATED_MARKER_RE.search(head)) or "<auto-generated" in head
+
+
+# ---------------------------------------------------------------------------
+# flags
+#
+# Hard flags force the group that holds them to high risk. Hints are shown next to the
+# group but set no minimum.
+
+FLAGS = {
+    # hard
+    "ci": ("hard", "CI or build configuration changed"),
+    "local-exec": ("hard", "config that runs code on developer machines changed"),
+    "registry-config": ("hard", "package registry configuration changed"),
+    "install-script": ("hard", "package install script changed"),
+    "lockfile-integrity": ("hard", "lockfile checksum or source changed at the same version"),
+    "lockfile-source": ("hard", "lockfile resolves a package from outside the registry"),
+    "lockfile-unexplained": ("hard", "lockfile adds packages but no manifest changed"),
+    "lockfile-unaccounted": ("hard", "lockfile changed in ways yog could not parse or account for"),
+    "lockfile-identity": ("hard", "lockfile entry resolves to a different package than its name"),
+    "dep-install-script": ("hard", "new dependency runs an install script"),
+    "review-surface": ("hard", "file that controls review or diff display changed"),
+    "sensitive-rename": ("hard", "file renamed or copied into a sensitive path"),
+    "binary": ("hard", "binary file added or changed"),
+    "test-deleted": ("hard", "test file deleted"),
+    "test-skip": ("hard", "test skipped, focused or marked expected to fail"),
+    "suppression": ("hard", "lint, type or coverage check suppressed"),
+    "hidden-text": ("hard", "invisible or control characters"),
+    "mixed-script": ("hard", "identifier mixes Latin with look-alike letters"),
+    "exec-bit": ("hard", "executable bit changed"),
+    "symlink": ("hard", "symlink added or changed"),
+    "policy-sensitive": ("hard", "path marked sensitive by the base branch's .github/yog.json"),
+    "submodule": ("hard", "submodule changed; its content is not reviewed"),
+    # hints
+    "sensitive-keyword": ("hint", "security-related names"),
+    "dangerous-call": ("hint", "call that runs code, shells out or writes raw HTML"),
+    "migration": ("hint", "database migration or SQL"),
+    "ai-addressed": ("hint", "text that addresses AI tools or reviewers"),
+    "homoglyph": ("hint", "identifier made of look-alike letters"),
+    "claims-generated": ("hint", "new file says it is generated; reviewed as normal code"),
+    "long-line": ("hint", "very long added line"),
+    "assertions-removed": ("hint", "more assertions removed than added"),
+    "dependency": ("hint", "dependencies changed"),
+    "sensitive-path": ("hint", "file added or changed in a path that runs or loads code"),
+    "lockfile-unparsed": ("hint", "lockfile format not checked; read it"),
+    "lockfile-new-packages": ("hint", "packages new to the lockfile"),
+}
+
+SKIP_RE = re.compile(
+    r"\b(?:it|test|describe|context|suite|specify)\.(?:skip|only|todo|fixme)(?:\.each)?\s*[(`]|"
+    r"\bSkip\s*=\s*\"|\[Ignore\b|@Test\s*\([^)]{0,200}enabled\s*=\s*false|\bmarkTestSkipped\s*\(|"
+    r"addopts[^\n]{0,200}--ignore|"
+    r"(?<![.\w$])[xf](?:it|describe|test|context)\s*\(|"
+    r"@pytest\.mark\.(?:skip|skipif|xfail)\b|\bpytest\.(?:skip|xfail)\s*\(|"
+    r"@unittest\.(?:skip|skipIf|skipUnless|expectedFailure)\b|\bself\.skipTest\s*\(|"
+    r"\bt\.Skip(?:Now|f)?\s*\(|@(?:Disabled|Ignore)\b|#\[ignore\]|"
+    r"\bskip\s*:\s*true\b|\.skip\s*\(\s*['\"]|pytestmark\s*=\s*\[?\s*pytest\.mark\.(?:skip|xfail)|"
+    r"\braise\s+(?:unittest\.)?SkipTest\b|\bthis\.skip\s*\(|testPathIgnorePatterns|modulePathIgnorePatterns|"
+    r"--deselect\b|\s-k\s+['\"]?not\b|\bcollect_ignore\b|#\[ignore\s*=|\.(?:skipIf|runIf|failing)\s*\(|"
+    r"@skip\s*\(|@Disabled(?:If|On)\w*|pytest[^\n]{0,200}--ignore"
+)
+SUPPRESS_RE = re.compile(
+    r"eslint-disable|@ts-ignore|@ts-nocheck|@ts-expect-error|#\s*noqa\b|#\s*type:\s*ignore|"
+    r"pragma:\s*no\s*cover|\bnolint\b|NOLINT|#\s*nosec\b|@SuppressWarnings|#!?\[allow\(|"
+    r"rubocop:disable|pylint:\s*disable|istanbul\s+ignore|[cv]8\s+ignore|biome-ignore|"
+    r"deno-lint-ignore|oxlint-disable|@phpstan-ignore|phpcs:ignore|swiftlint:disable|"
+    r"mypy:\s*ignore|pyright:\s*ignore|shellcheck\s+disable|@SuppressLint|coverage:\s*ignore"
+)
+DANGER_RE = re.compile(
+    r"(?<![.\w])eval\s*\(|\bnew\s+Function\s*\(|(?<![.\w])exec\s*\(|\bchild_process\b|\bexecSync\s*\(|"
+    r"\bspawn(?:Sync)?\s*\(|\bsubprocess\.|\bos\.system\s*\(|\bos\.popen\s*\(|shell\s*=\s*True|"
+    r"dangerouslySetInnerHTML|\.(?:inner|outer)HTML\s*=|document\.write\s*\(|"
+    r"insertAdjacentHTML|\bpickle\.loads?\s*\(|\byaml\.load\s*\((?![^)]*Loader=yaml\.SafeLoader)|"
+    r"\bunserialize\s*\(|\bMarshal\.load|Runtime\.getRuntime\(\)\.exec|\bProcessBuilder\s*\(|"
+    r"\bv-html\b|\|\s*safe\b|\bmark_safe\s*\(|\bhtml_safe\b|curl[^|\n]{0,200}\|\s*(?:ba)?sh\b|"
+    r"wget[^|\n]{0,200}\|\s*(?:ba)?sh\b"
+)
+AI_RE = re.compile(
+    r"ignore (?:all |any )?(?:the )?(?:previous|prior|above|earlier|preceding) "
+    r"(?:instructions|prompts?|rules)|\b(?:ai|llm|gpt|claude|copilot) "
+    r"(?:reviewer|agent|assistant|model)s?\b|\bas an ai\b|\blanguage model\b|"
+    r"\byou are (?:an? |the )?(?:ai|assistant|reviewer|llm|agent)\b|"
+    r"\bdo not (?:flag|report|mention|review|question)\b|\bsystem prompt\b|<\|im_(?:start|end)\|>|"
+    r"</?(?:system|assistant|instructions?)>|\breviewers?\s*:\s*(?:ignore|skip|approve)|"
+    r"\b(?:approve|lgtm) (?:this|the) (?:pr|pull request|change)|\bnote to (?:the )?(?:ai|reviewer|agent)",
+    re.IGNORECASE)
+ASSERT_RE = re.compile(r"\bassert\w*\b|\bexpect\s*\(|\bshould\b|\.to(?:Be|Equal|Have|Throw|Match)\w*\s*\(|"
+                       r"\bt\.(?:Error|Fatal|Fail)\w*\s*\(|\brequire\.\w+\s*\(")
+SENSITIVE_WORDS = set("""
+auth authn authz authenticate authenticated authentication authorize authorized authorization
+token tokens jwt oauth saml sso cipher encrypt encrypted encryption decrypt hmac password
+passwords passwd secret secrets credential credentials apikey cors csrf xss sanitize sanitizer
+permission permissions acl rbac sudo privilege privileges otp mfa totp
+""".split())
+WORD_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+")
+IDENT_RE = re.compile(r"[^\W\d_][\w]*", re.UNICODE)
+CONFUSABLE_SCRIPTS = set(["LATIN", "CYRILLIC", "GREEK", "ARMENIAN", "CHEROKEE", "COPTIC"])
+HOMOGLYPHS = set(
+    "\u0430\u0435\u043e\u0440\u0441\u0443\u0445\u0456\u0458\u0455\u0501\u051b\u051d\u0410\u0412"
+    "\u0415\u041a\u041c\u041d\u041e\u0420\u0421\u0422\u0425\u0406\u0408\u0405\u03bf\u03b1\u03bd"
+    "\u03c1\u03c4\u0391\u0392\u0395\u0396\u0397\u0399\u039a\u039c\u039d\u039f\u03a1\u03a4\u03a5\u03a7"
+)
+SHA_PIN_RE = re.compile(r"@[0-9a-f]{40}\b")
+
+
+def words_in(s):
+    out = set()
+    for token in re.findall(r"[A-Za-z]+", s):
+        for w in WORD_RE.findall(token):
+            out.add(w.lower())
+    return out
+
+
+def scripts_of(token):
+    found = set()
+    for ch in token:
+        if ch.isalpha():
+            name = unicodedata.name(ch, "")
+            script = name.split(" ")[0] if name else ""
+            if script in CONFUSABLE_SCRIPTS:
+                found.add(script)
+    return found
+
+
+def line_hidden(line, first_line):
+    s = line[1:] if first_line and line.startswith("\ufeff") else line
+    return [s[i] for i in hidden_positions(s, allow_emoji_zwj=True)]
+
+
+class FlagSet(object):
+    def __init__(self):
+        self.items = {}
+
+    def add(self, code, file_index, units, detail=None):
+        key = (code, file_index)
+        entry = self.items.get(key)
+        if entry is None:
+            tier, title = FLAGS[code]
+            entry = self.items[key] = {"code": code, "tier": tier, "title": title,
+                                       "file": file_index, "units": [], "details": []}
+        for u in units:
+            if u not in entry["units"]:
+                entry["units"].append(u)
+        if detail and detail not in entry["details"] and len(entry["details"]) < 5:
+            entry["details"].append(detail)
+
+    def listing(self):
+        def order(e):
+            return (0 if e["tier"] == "hard" else 1, e["file"] or 0, e["code"])
+        return sorted(self.items.values(), key=order)
+
+
+def cite(unit, kind, number):
+    return "%s:%s%d" % (unit["id"], "+" if kind == "+" else "-", number)
+
+
+def scan_lines(f, units, flags):
+    """Line-level flags for one file's text units."""
+    cls = f["class"]
+    assert_added = assert_removed = 0
+    for unit in units:
+        if unit["kind"] != "hunk":
+            continue
+        for kind, old_no, new_no, line in unit["lines"]:
+            if kind == "-":
+                if cls == "test" and ASSERT_RE.search(line):
+                    assert_removed += 1
+                continue
+            if kind != "+":
+                continue
+            ref = cite(unit, "+", new_no)
+            bad = line_hidden(line, new_no == 1)
+            if bad:
+                flags.add("hidden-text", f["index"], [unit["id"]], "%s %s" % (ref, char_codes(bad)))
+            if cls in ("lockfile",):
+                continue
+            for token in IDENT_RE.findall(line):
+                if len(scripts_of(token)) > 1:
+                    flags.add("mixed-script", f["index"], [unit["id"]], "%s %s" % (ref, clean_line(token)))
+                elif cls != "docs" and any(ch in HOMOGLYPHS for ch in token) and all(
+                        ord(ch) < 128 or ch in HOMOGLYPHS for ch in token):
+                    flags.add("homoglyph", f["index"], [unit["id"]], "%s %s" % (ref, clean_line(token)))
+            if AI_RE.search(line):
+                flags.add("ai-addressed", f["index"], [unit["id"]], ref)
+            if cls == "docs":
+                continue
+            if SKIP_RE.search(line) and cls in ("test", "source", "config", "ci", "manifest"):
+                flags.add("test-skip", f["index"], [unit["id"]], ref)
+            if SUPPRESS_RE.search(line):
+                flags.add("suppression", f["index"], [unit["id"]], ref)
+            if cls == "test" and ASSERT_RE.search(line):
+                assert_added += 1
+            if cls in ("source", "ci", "manifest", "config"):
+                if DANGER_RE.search(line):
+                    flags.add("dangerous-call", f["index"], [unit["id"]], ref)
+                hit = sorted(words_in(line) & SENSITIVE_WORDS)
+                if hit:
+                    flags.add("sensitive-keyword", f["index"], [unit["id"]], ", ".join(hit[:4]))
+            if len(line) > LONG_LINE and not f["generated_base"]:
+                flags.add("long-line", f["index"], [unit["id"]], "%s %d chars" % (ref, len(line)))
+            if cls == "ci":
+                note = ci_note(line)
+                if note:
+                    flags.add("ci", f["index"], [unit["id"]], "%s %s" % (ref, note))
+    if cls == "test" and assert_removed > assert_added:
+        flags.add("assertions-removed", f["index"], [u["id"] for u in units],
+                  "%d removed, %d added" % (assert_removed, assert_added))
+
+
+def ci_note(line):
+    s = line.strip()
+    if "pull_request_target" in s:
+        return "pull_request_target trigger"
+    if re.search(r"\bworkflow_run\b", s):
+        return "workflow_run trigger"
+    if re.search(r"\bpermissions\b", s) or re.search(r":\s*write\b", s):
+        return "permissions"
+    if "${{" in s and "github.event." in s:
+        return "event data in an expression"
+    if re.search(r"\bsecrets\.", s):
+        return "uses secrets"
+    match = re.search(r"\buses:\s*([^\s#]+)", s)
+    if match and not match.group(1).startswith("./") and not SHA_PIN_RE.search(match.group(1)) \
+            and not match.group(1).startswith("docker://"):
+        return "action not pinned to a commit: %s" % clean_line(match.group(1))
+    if re.search(r"curl[^|]{0,200}\|\s*(?:ba)?sh|wget[^|]{0,200}\|\s*(?:ba)?sh", s):
+        return "pipes a download into a shell"
+    return None
+
+
+def file_flags(f, units, flags, config):
+    """Flags that depend on the file as a whole."""
+    path, old_path, idx = f["path"], f["old_path"], f["index"]
+    all_ids = [u["id"] for u in units]
+    shown = path or old_path
+    both = [p for p in (path, old_path) if p]
+    if f["class"] == "ci" or f.get("old_class") == "ci":
+        flags.add("ci", idx, all_ids, None if f["class"] == "ci" else "moved out of CI config: %s" % clean_line(old_path))
+    if any(any_glob(LOCAL_EXEC_GLOBS, p) for p in both):
+        flags.add("local-exec", idx, all_ids)
+    if any(any_glob(REGISTRY_GLOBS, p) for p in both):
+        flags.add("registry-config", idx, all_ids)
+    if f.get("old_class") == "lockfile" and f["class"] != "lockfile" or (
+            f["class"] == "lockfile" and f["status"] in "RC" and f.get("old_class") != "lockfile"):
+        flags.add("sensitive-rename", idx, all_ids, "lockfile name changed: %s -> %s" % (
+            clean_line(old_path or ""), clean_line(path or "")))
+    policy = config["sensitive"]
+    if policy and any(any_glob(policy, p) for p in both):
+        flags.add("policy-sensitive", idx, all_ids)
+    if path and f["status"] != "D" and any_glob(EXEC_HINT_GLOBS, path) and f["class"] not in ("ci",):
+        flags.add("sensitive-path", idx, all_ids)
+    if any_glob(REVIEW_SURFACE_GLOBS, shown) or (old_path and any_glob(REVIEW_SURFACE_GLOBS, old_path)):
+        flags.add("review-surface", idx, all_ids)
+    sensitive = SENSITIVE_GLOBS + config["sensitive"]
+    if f["status"] in "RC" and path and any_glob(sensitive, path) and not any_glob(sensitive, old_path):
+        flags.add("sensitive-rename", idx, all_ids, "%s -> %s" % (clean_line(old_path), clean_line(path)))
+    if f["status"] in "RC" and path and os.path.splitext(old_path)[1].lower() not in CODE_EXT \
+            and os.path.splitext(path)[1].lower() in CODE_EXT:
+        flags.add("sensitive-rename", idx, all_ids, "became code: %s -> %s" % (
+            clean_line(old_path), clean_line(path)))
+    if f["class"] == "binary" and f["status"] != "D":
+        flags.add("binary", idx, all_ids)
+    if f.get("old_class") == "test" and (f["status"] == "D" or f["class"] != "test"):
+        flags.add("test-deleted", idx, all_ids, None if f["status"] == "D" else "no longer a test path: %s" % clean_line(path))
+    elif f["status"] in "R" and TEST_NAME_RE.search(os.path.basename(old_path)) and \
+            not TEST_NAME_RE.search(os.path.basename(path)):
+        flags.add("test-deleted", idx, all_ids, "no longer named as a test: %s" % clean_line(path))
+    old_kind, new_kind = blob_kind(f["old_mode"]), blob_kind(f["new_mode"])
+    if f["old_mode"] and f["new_mode"] and old_kind == new_kind == "file" and f["old_mode"] != f["new_mode"]:
+        flags.add("exec-bit", idx, all_ids, "%s -> %s" % (f["old_mode"], f["new_mode"]))
+    if f["status"] == "A" and f["new_mode"] == "100755":
+        flags.add("exec-bit", idx, all_ids, "new executable file")
+    if (new_kind == "symlink" and f["status"] != "D") or (old_kind == "symlink" and new_kind not in (None, "symlink")):
+        flags.add("symlink", idx, all_ids, f.get("link_target"))
+    if MODE_SUBMODULE in (f["old_mode"], f["new_mode"]):
+        flags.add("submodule", idx, all_ids, "%s -> %s" % ((f["old_blob"] or "none")[:12], (f["new_blob"] or "none")[:12]))
+    if any(unsafe_chars(p) or re.search(r"[\n\t\r]", p) for p in both):
+        flags.add("hidden-text", idx, all_ids, "in the file name")
+    if any_glob(MIGRATION_GLOBS, shown) and f["class"] not in ("docs", "test"):
+        flags.add("migration", idx, all_ids)
+    if f["class"] not in ("docs", "lockfile"):
+        hit = sorted(words_in(shown) & SENSITIVE_WORDS)
+        if hit:
+            flags.add("sensitive-keyword", idx, all_ids, "path: " + ", ".join(hit[:4]))
+    if f["claims_generated"]:
+        flags.add("claims-generated", idx, all_ids)
+
+
+# ---------------------------------------------------------------------------
+# dependencies
+
+NPM_REGISTRIES = ("https://registry.npmjs.org/", "https://registry.yarnpkg.com/")
+INSTALL_SCRIPTS = ("preinstall", "install", "postinstall", "prepare", "prepublish", "prepack")
+
+
+def load_json_bytes(data):
+    if data is None:
+        return None
+    try:
+        return json.loads(text(data).lstrip("\ufeff"))
+    except ValueError:
+        return None
+
+
+META_KEY = "\0meta"
+
+
+def meta_entry(blob):
+    """A pseudo entry for lockfile content outside package entries (root project, importers),
+    so that changes there count as accounted for without being reported as packages."""
+    return {"version": hashlib.sha256(blob.encode("utf-8", "surrogateescape")).hexdigest(),
+            "resolved": None, "integrity": None, "install": False}
+
+
+def npm_lock_entries(data):
+    """{key: {version, resolved, integrity, install}} from package-lock / npm-shrinkwrap."""
+    doc = load_json_bytes(data)
+    out = {}
+    if not isinstance(doc, dict):
+        return None
+    packages = doc.get("packages")
+    root = packages.get("") if isinstance(packages, dict) else None
+    out[META_KEY] = meta_entry(json.dumps([doc.get("name"), doc.get("version"), root], sort_keys=True, default=str))
+    if isinstance(packages, dict):
+        for key, entry in packages.items():
+            if not key or not isinstance(entry, dict) or entry.get("link"):
+                continue
+            out[key] = {"version": entry.get("version"), "resolved": entry.get("resolved"),
+                        "integrity": entry.get("integrity"), "install": bool(entry.get("hasInstallScript")),
+                        "alias": entry.get("name") if isinstance(entry.get("name"), str) else None,
+                        "local": "node_modules/" not in key}
+        return out
+
+    def walk(deps, prefix):
+        for name, entry in (deps or {}).items():
+            if not isinstance(entry, dict):
+                continue
+            key = prefix + "node_modules/" + name
+            version = entry.get("version")
+            resolved = entry.get("resolved")
+            if isinstance(version, str) and re.search(r"[:/]", version):
+                resolved = resolved or version
+            out[key] = {"version": version, "resolved": resolved,
+                        "integrity": entry.get("integrity"), "install": False}
+            walk(entry.get("dependencies"), key + "/")
+    walk(doc.get("dependencies"), "")
+    return out
+
+
+def strip_yaml_comment(line):
+    out, quote = [], None
+    for i, ch in enumerate(line):
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "#" and (i == 0 or line[i - 1] in " \t"):
+            break
+        out.append(ch)
+    return "".join(out).rstrip()
+
+
+def yaml_pairs(fragment):
+    """key: value pairs from an inline {a: b, c: d} map or a single `key: value` line."""
+    fragment = fragment.strip().lstrip("{").rstrip("}")
+    out = {}
+    for part in fragment.split(","):
+        if ":" in part:
+            k, v = part.split(":", 1)
+            out[k.strip().strip("'\"")] = v.strip().strip("'\"")
+    return out
+
+
+PNPM_ENTRY_RE = re.compile(r"^(['\"]?)(/?[^\s'\"{}]+)\1:\s*(.*)$")
+FLOW_RESOLUTION_RE = re.compile(r"resolution:\s*(?:&\S+\s*)?\{([^}]*)\}")
+
+
+def pnpm_lock_entries(data):
+    """{name@version: {...}} from the packages section of pnpm-lock.yaml (line based).
+    Handles block and flow entries at any indent, anchors and comments."""
+    out = {}
+    if data is None:
+        return out
+    section, key, res_indent, entry_indent = None, None, None, None
+    lines, buf = [], None
+    for raw in text(data).lstrip("\ufeff").splitlines():
+        line = strip_yaml_comment(raw)
+        if buf is not None:
+            buf += " " + line.strip()
+            if buf.count("{") <= buf.count("}"):
+                lines.append(buf)
+                buf = None
+            continue
+        if line.count("{") > line.count("}"):
+            buf = line
+            continue
+        lines.append(line)
+    if buf is not None:
+        return None
+    meta = []
+    for line in lines:
+        line = re.sub(r"^(\s*)(['\"])([\w-]+)\2:", r"\1\3:", line)
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        if indent == 0:
+            section, key, res_indent, entry_indent = line.rstrip(":").strip(), None, None, None
+            if section != "packages":
+                meta.append(line)
+            continue
+        if section != "packages":
+            meta.append(line)
+            continue
+        if entry_indent is None:
+            entry_indent = indent
+        stripped = line.strip()
+        if indent == entry_indent:
+            match = PNPM_ENTRY_RE.match(stripped)
+            if not match:
+                return None
+            key = match.group(2).lstrip("/")
+            if "@" not in key[1:]:
+                v5 = re.match(r"^(@?[^/]+(?:/[^/@]+)?)/(\d[^/]*)$", key)
+                if v5:
+                    key = "%s@%s" % (v5.group(1), v5.group(2))
+            at = key.rfind("@")
+            version = key[at + 1:] if at > 0 else ""
+            out[key] = {"version": version.split("(")[0], "resolved": None, "integrity": None, "install": False}
+            res_indent = None
+            rest = match.group(3).strip()
+            if rest.startswith("&"):
+                rest = rest.split(None, 1)[1] if " " in rest else ""
+            if rest.startswith("{"):
+                inline = FLOW_RESOLUTION_RE.search(rest)
+                if inline:
+                    apply_resolution(out[key], yaml_pairs(inline.group(1)))
+                if re.search(r"requiresBuild:\s*true\b", rest):
+                    out[key]["install"] = True
+            elif rest:
+                return None
+            continue
+        if key is None or indent < entry_indent:
+            return None
+        if res_indent is not None and indent <= res_indent:
+            res_indent = None
+        if stripped.startswith("resolution:"):
+            rest = re.sub(r"^resolution:\s*(?:&\S+\s*)?", "", stripped)
+            if rest.startswith("*"):
+                return None
+            if rest:
+                pairs = yaml_pairs(rest)
+                if any(not v or v.startswith("*") for v in pairs.values()):
+                    return None
+                apply_resolution(out[key], pairs)
+            else:
+                res_indent = indent
+            continue
+        if res_indent is not None:
+            pairs = yaml_pairs(stripped)
+            if not pairs or any(not v or v.startswith("*") for v in pairs.values()):
+                return None
+            apply_resolution(out[key], pairs)
+            continue
+        if re.match(r"^requiresBuild:\s*true\b", stripped):
+            out[key]["install"] = True
+    out[META_KEY] = meta_entry("\n".join(meta))
+    return out
+
+
+def apply_resolution(entry, pairs):
+    if "integrity" in pairs:
+        entry["integrity"] = pairs["integrity"]
+    if "tarball" in pairs:
+        entry["resolved"] = pairs["tarball"]
+    if "repo" in pairs or pairs.get("type") == "git" or "commit" in pairs:
+        entry["resolved"] = "git+" + (pairs.get("repo") or "?")
+    if "directory" in pairs or pairs.get("type") == "directory" or "path" in pairs:
+        entry["resolved"] = "file:" + (pairs.get("directory") or pairs.get("path") or "?")
+
+
+def yarn_lock_entries(data):
+    """{name@version: {...}} from a yarn v1 lockfile. Yarn 2+ lockfiles return None."""
+    if data is None:
+        return {}
+    body = text(data)
+    if re.search(r"^__metadata:", body, re.MULTILINE):
+        return UNSUPPORTED
+    out, name, entry = {}, None, None
+    for line in body.splitlines():
+        if not line.strip() or line.startswith("#"):
+            continue
+        if not line.startswith(" "):
+            name = line.rstrip(":").strip()
+            first = name.split(",")[0].strip().strip('"')
+            alias = None
+            if "@npm:" in first:
+                target = first.split("@npm:", 1)[1]
+                at = target.rfind("@")
+                alias = target[:at] if at > 0 else target
+            entry = {"version": None, "resolved": None, "integrity": None, "install": False, "alias": alias}
+            out[name] = entry
+            continue
+        if entry is None:
+            continue
+        m = re.match(r'^\s+("(?:[^"\\]|\\.)*"|\S+)\s+(.*)$', line)
+        if not m:
+            continue
+        field = m.group(1)
+        if field.startswith('"'):
+            try:
+                field = json.loads(field)
+            except ValueError:
+                return None
+        value = m.group(2).strip()
+        if value.startswith('"') and value.endswith('"'):
+            try:
+                value = json.loads(value)
+            except ValueError:
+                value = value.strip('"')
+        if field == "version":
+            entry["version"] = value
+        elif field == "resolved":
+            entry["resolved"] = value.split("#")[0]
+        elif field == "integrity":
+            entry["integrity"] = value
+    out = dict((k, v) for k, v in out.items() if v["version"] is not None)
+    if not out and re.search(r"^\s+version", body, re.MULTILINE):
+        return None
+    return out
+
+
+UNSUPPORTED = "unsupported"
+LOCK_SOURCE_KEY_RE = re.compile(r"\b(?:resolved|tarball|resolution|repo)\b|@(?:https?:|git\+|file:|link:)")
+LOCK_REMOTE_RE = re.compile(r"(?:[a-z][a-z0-9+.-]*://|git\+|file:)[^\s\"',}]+")
+LOCK_INFO_RE = re.compile(r"^\s*\"?(?:deprecated|funding|url|homepage|bugs|description|license)\"?\s*[:\s]")
+LOCK_URL_RE = re.compile(r"(?:[a-z][a-z0-9+.-]*://|git\+|file:|link:)[^\s\"',}]+")
+LOCK_PARSERS = {
+    "package-lock.json": npm_lock_entries, "npm-shrinkwrap.json": npm_lock_entries,
+    "pnpm-lock.yaml": pnpm_lock_entries, "yarn.lock": yarn_lock_entries,
+}
+
+
+def lock_name(key):
+    """The package name of a lockfile key: npm paths, pnpm name@version, yarn spec lines."""
+    k = key.split("node_modules/")[-1] if "node_modules/" in key else key
+    k = k.split(",")[0].strip().strip('"').split("(")[0].split("@npm:")[0]
+    at = k.rfind("@")
+    return k[:at] if at > 0 else k
+
+
+SCOPED_TARBALL_RE = re.compile(r"^[a-z]+://[^?#]*/(@[^/]+/[^/]+)/-/[^/]+\.tgz(?:[?#].*)?$")
+TARBALL_RE = re.compile(r"^[a-z]+://[^?#]*/([^/@][^/]*)/-/[^/]+\.tgz(?:[?#].*)?$")
+
+
+def tarball_name(url):
+    """The package name in a registry tarball URL (/<name>/-/<file>.tgz), or None."""
+    url = urllib.parse.unquote(url or "")
+    m = SCOPED_TARBALL_RE.match(url) or TARBALL_RE.match(url)
+    return m.group(1) if m else None
+
+
+def registry_ok(url, extra=()):
+    allowed = list(NPM_REGISTRIES) + [r if r.endswith("/") else r + "/" for r in extra]
+    return not url or any(url.startswith(r) for r in allowed)
+
+
+def lockfile_review(f, old_data, new_data, manifest_changed, units, flags, registries=(), dep_texts=()):
+    """Compare a lockfile's entries at base and head. Returns a short summary."""
+    parser = LOCK_PARSERS.get(os.path.basename(f["path"] or f["old_path"]))
+    if f["status"] == "D":
+        flags.add("lockfile-unaccounted", f["index"], [u["id"] for u in units], "lockfile deleted")
+        return None
+    if parser is None:
+        flags.add("lockfile-unparsed", f["index"], [u["id"] for u in units])
+        return None
+    old = parser(old_data) if old_data is not None else {}
+    new = parser(new_data)
+    if UNSUPPORTED in (old, new):
+        flags.add("lockfile-unparsed", f["index"], [u["id"] for u in units])
+        return None
+    if old is None or new is None:
+        flags.add("lockfile-unaccounted", f["index"], [u["id"] for u in units], "could not parse it")
+        return None
+    ids, idx = [u["id"] for u in units], f["index"]
+    added = sorted(k for k in new if k not in old and k != META_KEY)
+    removed = sorted(k for k in old if k not in new and k != META_KEY)
+    changed = []
+    for key in sorted(set(old) & set(new) - set([META_KEY])):
+        a, b = old[key], new[key]
+        if a["version"] != b["version"]:
+            changed.append(key)
+            continue
+        if (a["integrity"] and b["integrity"] and a["integrity"] != b["integrity"]) or \
+                (a["resolved"] and b["resolved"] and a["resolved"] != b["resolved"]):
+            flags.add("lockfile-integrity", idx, ids, clean_line(key))
+    for key in added + changed:
+        entry = new[key]
+        if not registry_ok(entry["resolved"], registries):
+            flags.add("lockfile-source", idx, ids, "%s from %s" % (clean_line(key), clean_line(entry["resolved"])[:80]))
+        before = old.get(key)
+        if entry["install"] and not (before and before["install"]):
+            flags.add("dep-install-script", idx, ids, clean_line(key))
+    for key in sorted(set(new) - set([META_KEY])):
+        entry, before = new[key], old.get(key)
+        if before == entry:
+            continue
+        expected = entry.get("alias") or lock_name(key)
+        got = tarball_name(entry["resolved"])
+        if got and got != expected:
+            flags.add("lockfile-identity", idx, ids, "%s resolves to %s" % (clean_line(key), clean_line(got)))
+        alias = entry.get("alias")
+        if alias and alias != lock_name(key) and (not before or before.get("alias") != alias) and \
+                not any(("npm:%s@" % alias) in t for t in dep_texts):
+            flags.add("lockfile-identity", idx, ids, "%s is now an alias of %s" % (clean_line(key), clean_line(alias)))
+    old_names = set(lock_name(k) for k in old)
+    new_names = sorted(set(
+        lock_name(k) for k in added if lock_name(k) not in old_names and not new[k].get("local")
+        and not (new[k]["resolved"] or "").startswith(("file:", "link:"))))
+    if new_names:
+        detail = "%d new package%s, e.g. %s" % (len(new_names), "" if len(new_names) == 1 else "s",
+                                               clean_line(new_names[0]))
+        flags.add("lockfile-new-packages" if manifest_changed else "lockfile-unexplained", idx, ids, detail)
+    moved = any(old[k] != new[k] for k in set(old) & set(new)) or (META_KEY in old) != (META_KEY in new)
+    for kind, _, new_no, line in units[0]["lines"]:
+        if kind != "+" or LOCK_INFO_RE.search(line):
+            continue
+        urls = LOCK_URL_RE.findall(line) if LOCK_SOURCE_KEY_RE.search(line) else LOCK_REMOTE_RE.findall(line)
+        for url in urls:
+            if not registry_ok(url, registries):
+                flags.add("lockfile-source", idx, ids, "+%d %s" % (new_no, clean_line(url)[:80]))
+    if not added and not removed and not moved and (units[0]["added"] or units[0]["removed"]):
+        flags.add("lockfile-unaccounted", idx, ids, "lines changed but no package entry did")
+    return {"added": len(added), "removed": len(removed), "changed": len(changed)}
+
+
+NPM_SOURCE_RE = re.compile(r"^(?:git\+|git:|https?:|file:|link:|github:|gitlab:|bitbucket:|gist:)|"
+                           r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:#.*)?$")
+DEP_SECTIONS = ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies",
+                "overrides", "resolutions", "bundleDependencies", "bundledDependencies")
+
+
+def dep_changes(path, old_data, new_data):
+    """(dependency changes as strings, install-script changes as (key, value)) for a manifest."""
+    base = os.path.basename(path)
+    out, scripts = [], []
+    if base == "package.json":
+        old = load_json_bytes(old_data) or {}
+        new = load_json_bytes(new_data) or {}
+        if not isinstance(old, dict):
+            old = {}
+        if not isinstance(new, dict):
+            new = {}
+        for section in DEP_SECTIONS + ("pnpm.overrides",):
+            pick = lambda d: (d.get("pnpm") or {}).get("overrides") if section == "pnpm.overrides" and isinstance(d.get("pnpm"), dict) else d.get(section)
+            a, b = pick(old), pick(new)
+            a = dict((x, True) for x in a if isinstance(x, str)) if isinstance(a, list) else a
+            b = dict((x, True) for x in b if isinstance(x, str)) if isinstance(b, list) else b
+            a = a if isinstance(a, dict) else {}
+            b = b if isinstance(b, dict) else {}
+            for name in sorted(b):
+                if isinstance(b[name], str) and a.get(name) != b[name] and NPM_SOURCE_RE.search(b[name]):
+                    scripts.append(("package source", "%s: %s" % (name, b[name])))
+            for name in sorted(set(a) | set(b)):
+                if name not in a:
+                    out.append("+ %s %s (%s)" % (name, b[name], section))
+                elif name not in b:
+                    out.append("- %s (%s)" % (name, section))
+                elif a[name] != b[name]:
+                    out.append("~ %s %s -> %s (%s)" % (name, a[name], b[name], section))
+        sa = old.get("scripts") if isinstance(old.get("scripts"), dict) else {}
+        sb = new.get("scripts") if isinstance(new.get("scripts"), dict) else {}
+        for key in INSTALL_SCRIPTS:
+            if sa.get(key) != sb.get(key) and sb.get(key) is not None:
+                scripts.append((key, str(sb.get(key))))
+    elif base.endswith(".txt") or base in ("go.mod", "pnpm-workspace.yaml"):
+        a = set(l.strip() for l in split_lines(old_data or b"") if l.strip() and not l.strip().startswith(("#", "//")))
+        b = set(l.strip() for l in split_lines(new_data or b"") if l.strip() and not l.strip().startswith(("#", "//")))
+        out += ["+ " + l for l in sorted(b - a)] + ["- " + l for l in sorted(a - b)]
+        for l in sorted(b - a):
+            if REQ_SOURCE_RE.search(l):
+                scripts.append(("package source", l))
+    return [clean_line(str(o)) for o in out], scripts
+
+
+REQ_SOURCE_RE = re.compile(r"^(?:--(?:extra-)?index-url\b|-i\s|--find-links\b|-f\s|--trusted-host\b)|"
+                           r"\s@\s*\S+://|^(?:git|hg|svn|bzr)\+|^\S+://")
+
+
+def manifest_review(f, old_data, new_data, units, flags):
+    """Dependency changes in a manifest, as short strings; flags install-script changes."""
+    ids, idx = [u["id"] for u in units], f["index"]
+    out, scripts = dep_changes(f["path"] or f["old_path"], old_data, new_data)
+    for key, value in scripts:
+        code = "registry-config" if key == "package source" else "install-script"
+        flags.add(code, idx, ids, "%s: %s" % (key, clean_line(value)[:80]))
+    if out:
+        flags.add("dependency", idx, ids, "%d change%s" % (len(out), "" if len(out) == 1 else "s"))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# test pairing (heuristic)
+
+def norm_stem(path, test=False):
+    base = os.path.basename(path)
+    stem = "" if base.startswith(".") else base.split(".")[0]
+    if test:
+        stem = re.sub(r"^(?:test_|tests_)", "", stem)
+        stem = re.sub(r"(?:_test|_tests|_spec|Tests|Test|Spec|IT)$", "", stem)
+    return stem.lower()
+
+
+GENERIC_STEMS = set(["index", "main", "__init__", "mod", "lib", "src", "utils", "util", "app", "types"])
+
+
+def pair_tests(source_paths, head_tree, changed_paths):
+    """For each source path: 'changed', 'unchanged' or 'none', with the test files found."""
+    index = {}
+    for p in head_tree:
+        if is_test_path(p) and os.path.basename(p) != "conftest.py":
+            index.setdefault(norm_stem(p, test=True), []).append(p)
+    out = {}
+    for path in source_paths:
+        stem = norm_stem(path)
+        found = [p for p in index.get(stem, []) if p != path] if stem not in GENERIC_STEMS else []
+        parent = os.path.basename(os.path.dirname(path)).lower()
+        if parent and parent not in GENERIC_STEMS:
+            found += [p for p in index.get(parent, []) if p != path and p not in found]
+        if not found:
+            out[path] = {"status": "none", "tests": []}
+        elif any(p in changed_paths for p in found):
+            out[path] = {"status": "changed", "tests": [p for p in found if p in changed_paths][:3]}
+        else:
+            out[path] = {"status": "unchanged", "tests": found[:3]}
+    return out
+
+
+# ---------------------------------------------------------------------------
+# claims
+
+CLAIM_STOP = set("a an the to of and or for in on with by from is are be it this that".split())
+
+
+def claim_words(s):
+    """Words for spotting near-duplicate claims: no commit-type prefix, stopwords or plural s."""
+    s = re.sub(r"^\w+(?:\([^)]*\))?!?:\s*", "", s.lower())
+    out = set()
+    for w in re.findall(r"\w+", s):
+        if w in CLAIM_STOP:
+            continue
+        out.add(w[:-1] if len(w) > 3 and w.endswith("s") else w)
+    return out
+
+
+def extract_claims(title, body, subjects):
+    """Statements in the PR title, body and commit subjects, each of which the brief answers."""
+    found, seen, other_words = [], set(), {}
+
+    def add(source, s):
+        s = re.sub(r"\s+", " ", s).strip()
+        s = re.sub(r"^(?:[-*+]|\d+[.)])\s+", "", s).strip()
+        if len(re.findall(r"\w+", s)) < 3:
+            return
+        if re.match(r"^\S+://\S+$", s) or s.endswith(":") or s.endswith(":**") or \
+                re.match(r"^\*\*[^*]+\*\*:?$", s) or re.match(r"^_[^_]+_$", s):
+            return
+        key = s.lower().rstrip(".")
+        words = claim_words(s)
+        for other in seen:
+            if other == key or (words and len(words & other_words[other]) >= 0.7 * len(words | other_words[other])):
+                return
+        seen.add(key)
+        other_words[key] = words
+        if len(s) > MAX_CLAIM_CHARS:
+            s = s[:MAX_CLAIM_CHARS - 3] + "..."
+        found.append((source, s))
+
+    if title:
+        add("title", title)
+    for subject in subjects:
+        if subject and not re.match(r"^Merge (?:branch|pull request|remote-tracking)", subject):
+            add("commit", subject)
+    body = (body or "").replace("\r\n", "\n")
+    body = re.sub(r"<!--.*?-->", "", body, flags=re.DOTALL)
+    body = re.sub(r"```.*?```", "", body, flags=re.DOTALL)
+    body = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", body)
+    paragraph = []
+
+    def flush():
+        if paragraph:
+            for sentence in re.split(r"(?<=[.!?])\s+", " ".join(paragraph)):
+                add("body", sentence)
+            del paragraph[:]
+
+    for line in body.split("\n"):
+        s = line.strip()
+        if not s or s.startswith("#") or s.startswith("|") or s.startswith(">"):
+            flush()
+            continue
+        if re.match(r"^[-*+]\s+\[ \]", s):
+            flush()
+            continue
+        if re.match(r"^(?:[-*+]|\d+[.)])\s+", s):
+            flush()
+            add("body", re.sub(r"^[-*+]\s+\[[xX]\]\s*", "", s))
+            continue
+        paragraph.append(s)
+    flush()
+    rank = {"title": 0, "body": 1, "commit": 2}
+    found.sort(key=lambda x: rank[x[0]])
+    # Keep the title and commit subjects; padding the description cannot push them out.
+    fixed = [x for x in found if x[0] != "body"]
+    body_items = [x for x in found if x[0] == "body"]
+    room = max(0, MAX_CLAIMS - len(fixed))
+    kept = set(id(x) for x in fixed[:MAX_CLAIMS] + body_items[:room])
+    chosen = [x for x in found if id(x) in kept]
+    claims = [{"id": "c%d" % i, "source": src, "text": s} for i, (src, s) in enumerate(chosen, 1)]
+    return claims, len(found) - len(chosen)
+
+
+# ---------------------------------------------------------------------------
+# facts
+
+def blob_data(reader, mode, sha):
+    if not sha or blob_kind(mode) not in ("file", "symlink"):
+        return None
+    return reader.read(sha)
+
+
+def compute_facts(ctx):
+    """Every computed fact for a diff. ctx: mode, pr (metadata or None), base_tip,
+    merge_base, head, subjects (local mode). Deterministic for the same commits."""
+    base_tip, merge_base, head = ctx["base_tip"], ctx["merge_base"], ctx["head"]
+    config = load_config(base_tip)
+    attr_rules = load_generated_attributes(base_tip, list_tree(base_tip))
+    changes = raw_changes(merge_base, head)
+    head_tree = list_tree(head)
+    changed_paths = set(c["path"] for c in changes if c["path"])
+    reader = BlobReader()
+    try:
+        blobs = [(blob_data(reader, c["old_mode"], c["old_blob"]), blob_data(reader, c["new_mode"], c["new_blob"]))
+                 for c in changes]
+    finally:
+        reader.close()
+    dep_dirs, dep_texts = [], []
+    for c, (old_data, new_data) in zip(changes, blobs):
+        p = c["path"] or c["old_path"]
+        if os.path.basename(p) in ("package.json", "pnpm-workspace.yaml"):
+            changed = dep_changes(p, old_data, new_data)[0]
+            if changed:
+                dep_dirs.append(os.path.dirname(p))
+                dep_texts.extend(changed)
+    binaries = [any(d is not None and looks_binary(d) for d in pair) for pair in blobs]
+
+    def hunks_for(i):
+        c, (old_data, new_data) = changes[i], blobs[i]
+        if binaries[i] or MODE_SUBMODULE in (c["old_mode"], c["new_mode"]):
+            return []
+        return file_hunks(c, old_data, new_data)
+    try:
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            all_hunks = list(pool.map(hunks_for, range(len(changes))))
+    except (ImportError, RuntimeError):
+        all_hunks = [hunks_for(i) for i in range(len(changes))]
+    flags = FlagSet()
+    files, units = [], []
+    for idx, c in enumerate(changes, 1):
+        path = c["path"] or c["old_path"]
+        old_data, new_data = blobs[idx - 1]
+        kinds = set(k for k in (blob_kind(c["old_mode"]), blob_kind(c["new_mode"])) if k)
+        binary = "file" in kinds and binaries[idx - 1]
+        if "submodule" in kinds:
+            cls = "submodule"
+        elif kinds == set(["symlink"]):
+            cls = "symlink"
+        else:
+            cls = classify(path, binary)
+        trusted = attribute_generated(attr_rules, path) or any_glob(config["generated"], path)
+        if trusted and c["status"] in "RC":
+            trusted = (c["old_blob"] == c["new_blob"]) and (
+                attribute_generated(attr_rules, c["old_path"]) or any_glob(config["generated"], c["old_path"]))
+        generated_base = bool(
+            old_data is not None and c["status"] == "M" and not binary
+            and has_generated_marker(old_data))
+        claims_generated = bool(
+            not trusted and not generated_base and c["status"] != "D" and not binary
+            and (has_generated_marker(new_data) or any_glob(GENERATED_NAME_GLOBS, path)))
+        f = dict(c)
+        old_cls = classify(c["old_path"], binary) if c["old_path"] and cls not in ("submodule", "symlink") else cls
+        f.update({
+            "index": idx, "class": cls, "old_class": old_cls, "binary": binary, "generated_trusted": trusted,
+            "generated_base": generated_base, "claims_generated": claims_generated,
+            "link_target": clean_line(text(new_data)) if blob_kind(c["new_mode"]) == "symlink" and new_data is not None else None,
+        })
+        text_ok = not binary and cls != "submodule"
+        hunks = all_hunks[idx - 1] if text_ok else []
+        file_units = make_units(idx, hunks, splittable=(cls != "lockfile"))
+        if cls == "lockfile":
+            whole = file_units[0]
+            for u in file_units[1:]:
+                whole["lines"].extend(u["lines"])
+                whole["added"] += u["added"]
+                whole["removed"] += u["removed"]
+            file_units = [whole]
+        f["head_lines"] = len(split_lines(new_data)) if text_ok and new_data is not None else 0
+        f["base_lines"] = len(split_lines(old_data)) if text_ok and old_data is not None else 0
+        f["added"] = sum(u["added"] for u in file_units)
+        f["removed"] = sum(u["removed"] for u in file_units)
+        file_flags(f, file_units, flags, config)
+        if cls != "lockfile":
+            scan_lines(f, file_units, flags)
+        else:
+            for kind, _, new_no, line in file_units[0]["lines"]:
+                if kind == "+" and line_hidden(line, new_no == 1):
+                    flags.add("hidden-text", idx, [file_units[0]["id"]], "+%d %s" % (new_no, char_codes(line_hidden(line, new_no == 1))))
+        lock_dir = os.path.dirname(path)
+        manifest_changed = any(d == lock_dir or not lock_dir or d.startswith(lock_dir + "/") for d in dep_dirs)
+        f["lock"] = lockfile_review(f, old_data, new_data, manifest_changed, file_units, flags,
+                                    config["registries"], dep_texts) if cls == "lockfile" else None
+        f["deps"] = manifest_review(f, old_data, new_data, file_units, flags) if is_manifest(path) else []
+        files.append(f)
+        units.extend(file_units)
+
+    pr = ctx.get("pr")
+    if pr:
+        title, body, subjects = pr["title"], pr["body"], pr["commit_subjects"]
+    else:
+        title, body, subjects = "", "", ctx.get("subjects", [])
+    for s in [title, body] + list(subjects):
+        if s and AI_RE.search(s):
+            flags.add("ai-addressed", None, [], "in the PR title, description or a commit message")
+            break
+    claims, claims_dropped = extract_claims(title, body, subjects)
+
+    flag_list = flags.listing()
+    flagged_files = set(e["file"] for e in flag_list if e["file"])
+    unit_flags = {}
+    for e in flag_list:
+        for uid in e["units"]:
+            unit_flags.setdefault(uid, []).append(e["code"])
+    for f in files:
+        reason = None
+        if f["index"] in flagged_files:
+            reason = None
+        elif f["class"] == "lockfile":
+            reason = "lockfile"
+        elif f["generated_trusted"]:
+            reason = "generated (base branch policy)"
+        elif f["generated_base"]:
+            reason = "generated (already generated on the base branch)"
+        elif (f["status"] == "R" and f["similarity"] == 100 and f["old_blob"] == f["new_blob"]
+              and f["old_mode"] == f["new_mode"]
+              and os.path.splitext(f["old_path"])[1] == os.path.splitext(f["path"])[1]
+              and f["class"] in ("docs", "asset") and f["old_class"] == f["class"]
+              and not any_glob(SENSITIVE_GLOBS, f["old_path"]) and not any_glob(SENSITIVE_GLOBS, f["path"])):
+            reason = "pure rename"
+        f["mechanical"] = reason
+    by_index = dict((f["index"], f) for f in files)
+    for u in units:
+        f = by_index[u["file"]]
+        u["flags"] = sorted(set(unit_flags.get(u["id"], [])))
+        if f["mechanical"]:
+            u["required"] = False
+        elif u["kind"] == "file":
+            u["required"] = not any(v["file"] == u["file"] and v["kind"] == "hunk" for v in units)
+        else:
+            u["required"] = True
+
+    sources = [f["path"] for f in files if f["class"] == "source" and f["status"] != "D" and not f["mechanical"]]
+    pairing = pair_tests(sources, head_tree, changed_paths)
+    for f in files:
+        f["pairing"] = pairing.get(f["path"]) if f["class"] == "source" else None
+
+    lockfiles = set(f["index"] for f in files if f["class"] == "lockfile")
+    for u in units:
+        u["lines_counted"] = 0 if u["file"] in lockfiles else u["added"] + u["removed"]
+    review_lines = sum(u["lines_counted"] for u in units if u["required"])
+    totals = {
+        "files": len(files), "added": sum(f["added"] for f in files), "removed": sum(f["removed"] for f in files),
+        "review_files": len([f for f in files if not f["mechanical"]]),
+        "mechanical_files": len([f for f in files if f["mechanical"]]),
+        "review_lines": review_lines,
+        "required_units": len([u for u in units if u["required"]]),
+        "large": review_lines >= LARGE_PR_LINES,
+    }
+    return {
+        "schema": FACTS_SCHEMA, "yog": VERSION, "mode": ctx["mode"],
+        "pr": dict((k, v) for k, v in (pr or {}).items() if k != "body") if pr else None,
+        "base_tip": base_tip, "merge_base": merge_base, "head": head,
+        "config_problems": config["problems"],
+        "files": files, "units": units, "flags": flag_list,
+        "claims": claims, "claims_dropped": claims_dropped, "totals": totals,
+    }
+
+
+FILE_KEYS = ("index", "path", "old_path", "status", "class", "binary", "old_mode", "new_mode", "head_lines", "base_lines",
+             "added", "removed", "mechanical", "pairing", "deps", "lock", "link_target")
+UNIT_KEYS = ("id", "file", "kind", "head", "base", "added", "removed", "required", "flags")
+
+
+def facts_json(facts):
+    out = dict(facts)
+    out["files"] = [dict((k, f.get(k)) for k in FILE_KEYS) for f in facts["files"]]
+    for f in out["files"]:
+        f["path"] = clean_line(f["path"]) if f["path"] else None
+        f["old_path"] = clean_line(f["old_path"]) if f["old_path"] else None
+    out["units"] = [dict((k, u.get(k)) for k in UNIT_KEYS) for u in facts["units"]]
+    if out.get("pr"):
+        out["pr"] = dict(out["pr"])
+        out["pr"]["title"] = clean_line(out["pr"]["title"])
+        out["pr"]["commit_subjects"] = [clean_line(s) for s in out["pr"]["commit_subjects"]]
+    out["claims"] = [dict(c, text=clean_line(c["text"])) for c in facts["claims"]]
+    return out
+
+
+# ---------------------------------------------------------------------------
+# collect
+
+def pr_ref(meta, name):
+    return "refs/yog/%s/%s/pr-%d/%s" % (meta["owner"], meta["repo"], meta["number"], name)
+
+
+def fetch_refs(meta, refspecs, shallow):
+    """Fetch from the PR's base repository into refs/yog/..., never touching branches."""
+    url = "https://%s/%s/%s.git" % (meta["host"], meta["owner"], meta["repo"])
+    gh_path = shutil.which("gh") or "gh"
+    args = ["-c", "credential.helper=", "-c", "credential.helper=!%s auth git-credential" % shlex.quote(gh_path),
+            "fetch", "--quiet", "--no-tags", "--no-recurse-submodules"]
+    if git_version() >= (2, 29):
+        args.append("--no-write-fetch-head")
+    if shallow:
+        args.append("--depth=1")
+    git(args + [url] + refspecs)
+
+
+def has_commit(sha):
+    return bool(sha) and git(["cat-file", "-e", sha + "^{commit}"], check=False) is not None
+
+
+def prepare_pr(meta, allow_merged=False):
+    """Fetch the PR's head and base commits and work out its merge base."""
+    if meta["state"] != "OPEN" and not allow_merged:
+        die("PR %s is %s; yog briefs open PRs (use --allow-merged to brief it anyway)" % (
+            meta["number"], meta["state"].lower()))
+    if not re.match(r"^[0-9a-f]{40,64}$", meta["head_oid"] or "") or \
+            not re.match(r"^[0-9a-f]{40,64}$", meta["base_oid"] or ""):
+        die("GitHub did not return the PR's head and base commits")
+    shallow = is_shallow()
+    head_ref, base_ref = pr_ref(meta, "head"), pr_ref(meta, "base")
+    fetch_refs(meta, ["+refs/pull/%d/head:%s" % (meta["number"], head_ref),
+                      "+%s:%s" % (meta["base_oid"], base_ref)], shallow)
+    head = rev(head_ref)
+    if head != meta["head_oid"]:
+        die("the PR's head moved while fetching (%s, expected %s); run collect again" % (
+            (head or "?")[:12], meta["head_oid"][:12]))
+    base_tip = meta["base_oid"]
+    mb = None if shallow else merge_base_local(base_tip, head)
+    if not mb:
+        mb = api_merge_base(meta, base_tip, head)
+        if not has_commit(mb):
+            fetch_refs(meta, ["+%s:%s" % (mb, pr_ref(meta, "merge-base"))], shallow)
+    return base_tip, mb, head
+
+
+def local_subjects(merge_base, head):
+    out = git(["log", "-z", "--format=%s", "%s..%s" % (merge_base, head)])
+    return [s for s in text(out).split("\0") if s][::-1]
+
+
+def work_dir(facts, override=None):
+    if override:
+        return override
+    gdir = git_dir()
+    if not gdir:
+        die("not in a git repository")
+    if facts["mode"] == "pr":
+        pr = facts["pr"]
+        key = safe_name(pr["owner"], pr["repo"], "pr", pr["number"])
+    else:
+        key = safe_name("local", facts["head"][:12])
+    return os.path.join(gdir, "yog", key)
+
+
+def brief_template(facts):
+    pr = facts["pr"]
+    return {
+        "schema": BRIEF_SCHEMA,
+        "pr": dict((k, pr[k]) for k in ("host", "owner", "repo", "number")) if pr else None,
+        "local": None if pr else {"base_tip": facts["base_tip"]},
+        "head": facts["head"], "merge_base": facts["merge_base"],
+        "summary": "",
+        "claims": dict((c["id"], {"text": clean_line(c["text"]), "status": "", "evidence": []}) for c in facts["claims"]),
+        "undisclosed": [],
+        "groups": [],
+        "not_examined": {"units": [], "reason": ""},
+        "questions": [],
+        "allow_large_group": "",
+        "todo_units": [u["id"] for u in facts["units"] if u["required"]],
+    }
+
+
+def refresh_brief(old, fresh):
+    """Keep the agent's work in a brief for the same commits, but bring its claims and
+    todo list up to date with the live PR text and units."""
+    old_claims = old.get("claims") if isinstance(old.get("claims"), dict) else {}
+    claims = {}
+    for cid, entry in fresh["claims"].items():
+        prev = old_claims.get(cid)
+        claims[cid] = prev if isinstance(prev, dict) and prev.get("text") == entry["text"] else entry
+    old["claims"] = claims
+    assigned = set()
+    for g in old.get("groups") or []:
+        if isinstance(g, dict) and isinstance(g.get("units"), list):
+            assigned.update(u for u in g["units"] if isinstance(u, str))
+    ne = old.get("not_examined")
+    if isinstance(ne, dict) and isinstance(ne.get("units"), list):
+        assigned.update(u for u in ne["units"] if isinstance(u, str))
+    old["todo_units"] = [u for u in fresh["todo_units"] if u not in assigned]
+
+
+def write_json(path, data):
+    directory = os.path.dirname(path)
+    try:
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, ensure_ascii=True)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except OSError as exc:
+        die("cannot write %s: %s" % (path, exc))
+
+
+def load_json_file(path, what):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (IOError, OSError) as exc:
+        die("cannot read %s %s: %s" % (what, path, exc))
+    except ValueError as exc:
+        die("%s %s is not valid JSON: %s" % (what, path, exc))
+
+
+def cmd_collect(args):
+    if args.base or args.head:
+        if args.pr or args.repo:
+            die("give a PR, or --base/--head for local commits, not both")
+        if not args.base:
+            die("--head needs --base")
+        base_tip, head = rev(args.base), rev(args.head or "HEAD")
+        if not base_tip or not head:
+            die("cannot resolve %s" % (args.base if not base_tip else args.head))
+        mb = merge_base_local(base_tip, head)
+        if not mb:
+            die("no merge base between %s and %s" % (args.base, args.head or "HEAD"))
+        facts = compute_facts({"mode": "local", "pr": None, "base_tip": base_tip, "merge_base": mb,
+                               "head": head, "subjects": local_subjects(mb, head)})
+    else:
+        host, owner, repo, number = resolve_pr(args.pr, args.repo)
+        meta = fetch_pr_meta(host, owner, repo, number)
+        base_tip, mb, head = prepare_pr(meta, args.allow_merged)
+        facts = compute_facts({"mode": "pr", "pr": meta, "base_tip": base_tip, "merge_base": mb, "head": head})
+    directory = work_dir(facts, args.dir)
+    facts_path = os.path.join(directory, "facts.json")
+    brief_path = os.path.join(directory, "brief.json")
+    write_json(facts_path, facts_json(facts))
+    kept = False
+    if os.path.exists(brief_path):
+        try:
+            with open(brief_path, encoding="utf-8") as fh:
+                old = json.load(fh)
+        except (IOError, OSError, ValueError):
+            old = None
+        fresh = brief_template(facts)
+        if isinstance(old, dict) and old.get("head") == facts["head"] and old.get("merge_base") == facts["merge_base"] \
+                and old.get("pr") == fresh["pr"] and old.get("local") == fresh["local"]:
+            kept = True
+            refresh_brief(old, fresh)
+            write_json(brief_path, old)
+        else:
+            old_head = old.get("head") if isinstance(old, dict) and isinstance(old.get("head"), str) else "old"
+            stale = os.path.join(directory, "brief-%s.json" % safe_name(old_head[:12]))
+            os.replace(brief_path, stale)
+            print("moved the brief for an older head to %s" % stale)
+    if not kept:
+        write_json(brief_path, brief_template(facts))
+    print_collect_summary(facts, facts_path, brief_path, kept, (args.base, args.head), args.allow_merged)
+    return 0
+
+
+def print_collect_summary(facts, facts_path, brief_path, kept, local_label=(None, None), allow_merged=False):
+    t = facts["totals"]
+    name = command_name()
+    if facts["pr"]:
+        pr = facts["pr"]
+        print("%s/%s#%d  %s" % (pr["owner"], pr["repo"], pr["number"], clean_line(pr["title"])))
+    print("head %s  merge base %s" % (facts["head"][:12], facts["merge_base"][:12]))
+    print("%d files, +%d -%d; %d need review (%d lines, %d units), %d mechanical" % (
+        t["files"], t["added"], t["removed"], t["review_files"], t["review_lines"],
+        t["required_units"], t["mechanical_files"]))
+    hard = [e for e in facts["flags"] if e["tier"] == "hard"]
+    hints = [e for e in facts["flags"] if e["tier"] == "hint"]
+    print("%d hard flag%s, %d hint%s, %d claim%s" % (
+        len(hard), "" if len(hard) == 1 else "s", len(hints), "" if len(hints) == 1 else "s",
+        len(facts["claims"]), "" if len(facts["claims"]) == 1 else "s"))
+    if t["large"]:
+        print("LARGE PR: %d lines need review. Propose a split along the groups." % t["review_lines"])
+    for p in facts["config_problems"]:
+        print("config: " + p)
+    print("facts: %s" % facts_path)
+    print("brief: %s%s" % (brief_path, " (kept: same head)" if kept else ""))
+    if facts["pr"]:
+        pr = facts["pr"]
+        target = "%s --repo %s/%s" % (pr["number"], pr["owner"], pr["repo"])
+    else:
+        target = "--base %s" % shlex.quote(local_label[0]) + (" --head %s" % shlex.quote(local_label[1]) if local_label[1] else "")
+    print("read:  %s hunks %s IDS" % (name, shlex.quote(facts_path)))
+    if allow_merged:
+        target += " --allow-merged"
+    print("check: %s check %s %s" % (name, shlex.quote(brief_path), target))
+
+
+# ---------------------------------------------------------------------------
+# check
+
+CITE_RE = re.compile(r"^(\d+\.\d+(?:\.\d+)?)(?::([+-])(\d+))?$")
+FILE_CITE_RE = re.compile(r"^(\d+):([+-])(\d+)$")
+PATH_CITE_RE = re.compile(r"^([^\s:]*[/.][^\s:]*):\+(\d+)$")
+UNIT_RE = re.compile(r"^\d+\.\d+(?:\.\d+)?$")
+GROUP_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,20}$")
+BRIEF_KEYS = set(["schema", "pr", "local", "head", "merge_base", "summary", "claims", "undisclosed",
+                  "groups", "not_examined", "questions", "allow_large_group", "todo_units"])
+GROUP_KEYS = set(["id", "title", "intent", "units", "risk", "why", "evidence", "tests", "tests_note",
+                  "tests_evidence"])
+CLAIM_KEYS = set(["text", "status", "evidence", "note"])
+LIMITS["note"] = 200
+
+
+SHA_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
+
+
+def resolve_target(args):
+    """What the user asked to check: a PR (from the arguments or the current branch) or a
+    local base. The brief must match it; the brief never chooses what gets checked."""
+    if getattr(args, "head", None) and not getattr(args, "base", None):
+        die("--head needs --base")
+    if getattr(args, "base", None):
+        if args.pr or args.repo:
+            die("give a PR, or --base for local commits, not both")
+        base_tip = rev(args.base)
+        head = rev(getattr(args, "head", None) or "HEAD")
+        if not base_tip or not head:
+            die("cannot resolve %s" % (args.base if not base_tip else args.head))
+        return {"mode": "local", "base_tip": base_tip, "head": head, "label": args.base}
+    host, owner, repo, number = resolve_pr(args.pr, args.repo)
+    return {"mode": "pr", "host": host, "owner": owner, "repo": repo, "number": number}
+
+
+def context_from_brief(brief, target, allow_merged=False):
+    """Rebuild the diff context for a brief and check it is current and is for the target.
+    Returns (ctx, problems)."""
+    head, mb = brief.get("head"), brief.get("merge_base")
+    if not isinstance(head, str) or not isinstance(mb, str) or not SHA_RE.match(head) or not SHA_RE.match(mb):
+        die("the brief has no valid head or merge_base; run collect again")
+    pr = brief.get("pr")
+    if target["mode"] == "pr":
+        want = (target["owner"].lower(), target["repo"].lower(), target["number"])
+        if not isinstance(pr, dict) or brief.get("local") is not None:
+            return None, ["this brief is not for %s/%s#%d; run collect for that PR" % (
+                target["owner"], target["repo"], target["number"])]
+        try:
+            got = (str(pr["owner"]).lower(), str(pr["repo"]).lower(), int(pr["number"]))
+        except (KeyError, TypeError, ValueError):
+            got = None
+        if got != want:
+            return None, ["this brief is not for %s/%s#%d; run collect for that PR" % (
+                target["owner"], target["repo"], target["number"])]
+        meta = fetch_pr_meta(target["host"], target["owner"], target["repo"], target["number"])
+        if meta["head_oid"] != head:
+            return None, ["stale: the PR's head is now %s, the brief is for %s; run collect again" % (
+                meta["head_oid"][:12], head[:12])]
+        base_tip, live_mb, live_head = prepare_pr(meta, allow_merged)
+        if live_mb != mb:
+            return None, ["stale: the PR's merge base is now %s, the brief is for %s; run collect again" % (
+                live_mb[:12], mb[:12])]
+        return {"mode": "pr", "pr": meta, "base_tip": base_tip, "merge_base": mb, "head": live_head}, []
+    local = brief.get("local")
+    if pr is not None or not isinstance(local, dict) or local.get("base_tip") != target["base_tip"]:
+        return None, ["this brief is not for local commits on %s; run collect --base %s" % (
+            clean_line(target["label"]), clean_line(target["label"]))]
+    base_tip = target["base_tip"]
+    if head != target["head"]:
+        return None, ["this brief is for head %s, not %s; run collect again or pass --head" % (
+            head[:12], target["head"][:12])]
+    live_mb = merge_base_local(base_tip, head)
+    if live_mb != mb:
+        return None, ["the brief's merge base does not match its commits; run collect again"]
+    return {"mode": "local", "pr": None, "base_tip": base_tip, "merge_base": mb, "head": head,
+            "subjects": local_subjects(mb, head)}, []
+
+
+C_LIKE = set([".js", ".mjs", ".cjs", ".jsx", ".ts", ".mts", ".cts", ".tsx", ".java", ".kt", ".scala",
+              ".c", ".h", ".cc", ".cpp", ".hpp", ".cs", ".go", ".rs", ".swift", ".dart", ".php"])
+HASH_LIKE = set([".py", ".rb", ".sh", ".bash", ".zsh", ".pl", ".r", ".ex", ".exs", ".toml", ".yml", ".yaml"])
+DASH_LIKE = set([".sql", ".lua", ".hs"])
+
+
+def comment_only(unit, path=""):
+    """True when every changed line of a hunk is a comment or blank, judged by the file's
+    language and by block-comment state across the hunk (a heuristic; unknown languages
+    never count as comment-only)."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in C_LIKE and ext not in HASH_LIKE and ext not in DASH_LIKE:
+        return False
+    in_block = in_string = False
+    for kind, _, _, line in unit["lines"]:
+        t = line.strip()
+        comment = not t
+        if ext in C_LIKE and t:
+            if in_block:
+                comment = True
+                if "*/" in t:
+                    in_block = False
+                    comment = not t.split("*/", 1)[1].strip()
+            elif t.startswith("//"):
+                comment = True
+            elif t.startswith("/*"):
+                if "*/" in t[2:]:
+                    comment = not t[2:].split("*/", 1)[1].strip()
+                else:
+                    in_block = comment = True
+        elif ext in HASH_LIKE and t:
+            quotes = t.count('"""') + t.count("\'\'\'")
+            comment = t.startswith("#") and not in_string
+            if quotes % 2:
+                in_string = not in_string
+                comment = False
+        elif ext in DASH_LIKE and t:
+            comment = t.startswith("--")
+        if kind in "+-" and not comment:
+            return False
+    return True
+
+
+def sentences(s):
+    return [p for p in re.split(r"(?<=[.!?])\s+", s.strip()) if p]
+
+
+class Checker(object):
+    def __init__(self, facts, brief):
+        self.facts, self.brief, self.problems = facts, brief, []
+        self.units = dict((u["id"], u) for u in facts["units"])
+        self.files = dict((f["index"], f) for f in facts["files"])
+        self.head_tree = None
+
+    def problem(self, msg):
+        self.problems.append(msg)
+
+    def string(self, where, value, limit_key, required=True):
+        if not isinstance(value, str):
+            self.problem("%s must be a string" % where)
+            return ""
+        if required and not value.strip():
+            self.problem("%s is empty" % where)
+        limit = LIMITS.get(limit_key)
+        if limit and len(value) > limit:
+            self.problem("%s is %d characters; the limit is %d" % (where, len(value), limit))
+        if "\n" in value or "\t" in value or "\r" in value:
+            self.problem("%s must be one line" % where)
+        bad = unsafe_chars(value.replace("\n", " ").replace("\t", " "))
+        if bad:
+            self.problem("%s contains hidden or control characters (%s)" % (where, char_codes(bad)))
+        return value
+
+    def citation(self, where, value, allowed_units=None, allowed_files=None):
+        """Validate one citation. Returns {"file": index, "unit": unit or None} or None.
+
+        Forms: UNIT:+N / UNIT:-N (a line in or within CITE_SLACK of that unit), F.0 (a whole-file
+        unit), and F:+N / F:-N (any line of changed file F at head or base, for context)."""
+        if not isinstance(value, str):
+            self.problem("%s: citation must be a string" % where)
+            return None
+        fmatch = FILE_CITE_RE.match(value)
+        if fmatch:
+            index, side, n = int(fmatch.group(1)), fmatch.group(2), int(fmatch.group(3))
+            f = self.files.get(index)
+            if f is None:
+                self.problem("%s: %d is not a file of this diff" % (where, index))
+                return None
+            if allowed_files is not None and index not in allowed_files:
+                self.problem("%s: file %d is not one of this group's files" % (where, index))
+                return None
+            count = f.get("head_lines" if side == "+" else "base_lines") or 0
+            if n < 1 or n > count:
+                self.problem("%s: file %d has no %s line %d" % (where, index, "head" if side == "+" else "base", n))
+                return None
+            return {"file": index, "unit": None, "kind": "context", "side": side}
+        match = CITE_RE.match(value)
+        if not match:
+            self.problem("%s: %r is not a citation (UNIT:+N, UNIT:-N, F:+N, F:-N, or F.0 for a whole file)"
+                         % (where, value))
+            return None
+        uid, side, number = match.group(1), match.group(2), match.group(3)
+        unit = self.units.get(uid)
+        if unit is None:
+            self.problem("%s: %s is not a unit of this diff" % (where, uid))
+            return None
+        if allowed_units is not None and uid not in allowed_units:
+            self.problem("%s: %s is not one of this group's units (cite context as F:+N)" % (where, uid))
+            return None
+        if side is None:
+            if unit["kind"] != "file":
+                self.problem("%s: %s needs a line, as %s:+N or %s:-N" % (where, uid, uid, uid))
+                return None
+            if any(v["file"] == unit["file"] and v["kind"] == "hunk" for v in self.facts["units"]):
+                self.problem("%s: file %d has changed lines; cite one of them instead of %s" % (where, unit["file"], uid))
+                return None
+            return {"file": unit["file"], "unit": unit, "kind": "unit", "side": None}
+        if unit["kind"] == "file":
+            self.problem("%s: %s is a whole-file unit; cite it without a line, or as %d:+N" % (where, uid, unit["file"]))
+            return None
+        span = unit["head"] if side == "+" else unit["base"]
+        n = int(number)
+        if not span or n < span[0] - CITE_SLACK or n > span[1] + CITE_SLACK:
+            self.problem("%s: line %s%d is outside unit %s (%s side %s); cite context as %d:%s%d" % (
+                where, side, n, uid, "head" if side == "+" else "base",
+                "%d-%d" % tuple(span) if span else "empty", unit["file"], side, n))
+            return None
+        return {"file": unit["file"], "unit": unit, "kind": "unit", "side": side}
+
+    def test_citation(self, where, value):
+        """tests_evidence also accepts PATH:+N for a test file the PR did not change."""
+        if isinstance(value, str) and not FILE_CITE_RE.match(value) and not CITE_RE.match(value):
+            m = PATH_CITE_RE.match(value)
+            if m:
+                path, n = m.group(1), int(m.group(2))
+                if unsafe_chars(path) or "\0" in path or path.startswith(("/", "-")) or \
+                        any(part in ("", ".", "..") for part in path.split("/")):
+                    self.problem("%s: %r is not a plain repository path" % (where, clean_line(path)))
+                    return None
+                if self.head_tree is None:
+                    self.head_tree = set(list_tree(self.facts["head"]))
+                if path not in self.head_tree:
+                    self.problem("%s: %s is not a file at the head commit" % (where, clean_line(path)))
+                    return None
+                if not is_test_path(path):
+                    self.problem("%s: %s is not a test file path" % (where, clean_line(path)))
+                    return None
+                data = read_path(self.facts["head"], path)
+                if data is None or looks_binary(data) or n < 1 or n > len(split_lines(data)):
+                    self.problem("%s: %s has no line %d at the head commit" % (where, clean_line(path), n))
+                    return None
+                return {"file": None, "path": path, "unit": None, "kind": "path", "side": "+"}
+        return self.citation(where, value)
+
+    def unit_list(self, where, value):
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+            self.problem("%s must be a list of unit ids" % where)
+            return []
+        out = []
+        for uid in value:
+            if uid not in self.units:
+                self.problem("%s: %s is not a unit of this diff" % (where, uid))
+            else:
+                out.append(uid)
+        return out
+
+    def hard_flags(self, unit_ids):
+        codes = set()
+        for uid in unit_ids:
+            for code in self.units[uid]["flags"]:
+                if FLAGS[code][0] == "hard":
+                    codes.add(code)
+        return codes
+
+    def run(self):
+        b = self.brief
+        if not isinstance(b, dict):
+            self.problem("the brief must be a JSON object")
+            return self.problems
+        for key in sorted(set(b) - BRIEF_KEYS):
+            self.problem("unknown field %r" % key)
+        if b.get("schema") != BRIEF_SCHEMA:
+            self.problem("schema must be %d" % BRIEF_SCHEMA)
+        summary = self.string("summary", b.get("summary"), "summary")
+        if summary and len(sentences(summary)) > MAX_SUMMARY_SENTENCES:
+            self.problem("summary has %d sentences; the limit is %d" % (len(sentences(summary)), MAX_SUMMARY_SENTENCES))
+        self.string("allow_large_group", b.get("allow_large_group", ""), "allow_large_group", required=False)
+        todo = b.get("todo_units", [])
+        if not isinstance(todo, list) or todo:
+            self.problem("todo_units still lists %s; assign each to a group or to not_examined, then empty it"
+                         % (", ".join(map(str, todo[:8])) + (" ..." if len(todo) > 8 else "") if isinstance(todo, list) else "?"))
+        self.check_claims()
+        assigned = {}
+        groups = self.check_groups(assigned)
+        self.check_not_examined(assigned)
+        self.check_coverage(assigned)
+        self.check_share(groups)
+        self.check_undisclosed()
+        questions = b.get("questions", [])
+        if not isinstance(questions, list):
+            self.problem("questions must be a list")
+        else:
+            if len(questions) > MAX_QUESTIONS:
+                self.problem("%d questions; the limit is %d" % (len(questions), MAX_QUESTIONS))
+            for i, q in enumerate(questions, 1):
+                self.string("question %d" % i, q, "question")
+        return self.problems
+
+    def check_claims(self):
+        claims = self.brief.get("claims")
+        if not isinstance(claims, dict):
+            self.problem("claims must be an object keyed by claim id")
+            return
+        ids = [c["id"] for c in self.facts["claims"]]
+        for cid in ids:
+            if cid not in claims:
+                self.problem("claim %s is not answered" % cid)
+        for cid in sorted(set(claims) - set(ids)):
+            self.problem("claim %s is not a claim this PR makes" % cid)
+        for cid in ids:
+            answer = claims.get(cid)
+            if answer is None:
+                continue
+            if not isinstance(answer, dict):
+                self.problem("claim %s must be an object" % cid)
+                continue
+            for key in sorted(set(answer) - CLAIM_KEYS):
+                self.problem("claim %s: unknown field %r" % (cid, key))
+            live = clean_line(next(c["text"] for c in self.facts["claims"] if c["id"] == cid))
+            if answer.get("text") != live:
+                self.problem("claim %s: its text no longer matches the PR (%r); run collect again, or restore "
+                             "the text field" % (cid, live[:60]))
+            status = answer.get("status")
+            if status not in CLAIM_STATUSES:
+                self.problem("claim %s: status must be one of %s" % (cid, ", ".join(CLAIM_STATUSES)))
+            evidence = answer.get("evidence", [])
+            if not isinstance(evidence, list):
+                self.problem("claim %s: evidence must be a list" % cid)
+                evidence = []
+            for e in evidence:
+                self.citation("claim %s" % cid, e)
+            if status in ("matches", "partial", "contradicted") and not evidence:
+                self.problem("claim %s is %s but cites no evidence" % (cid, status))
+            elif status in ("matches", "partial", "contradicted") and not any(
+                    isinstance(e, str) and CITE_RE.match(e) for e in evidence):
+                self.problem("claim %s is %s; cite at least one changed line (a unit citation), not only context"
+                             % (cid, status))
+            if "note" in answer:
+                self.string("claim %s note" % cid, answer["note"], "note", required=False)
+
+    def check_groups(self, assigned):
+        groups = self.brief.get("groups")
+        if not isinstance(groups, list):
+            self.problem("groups must be a list")
+            return []
+        required = [u for u in self.facts["units"] if u["required"]]
+        if required and not groups:
+            self.problem("there are units to review but no groups")
+        if len(groups) > MAX_GROUPS:
+            self.problem("%d groups; the limit is %d" % (len(groups), MAX_GROUPS))
+        seen, valid, last_rank = set(), [], None
+        for n, g in enumerate(groups, 1):
+            where = "group %d" % n
+            if not isinstance(g, dict):
+                self.problem("%s must be an object" % where)
+                continue
+            gid = g.get("id")
+            if not isinstance(gid, str) or not GROUP_ID_RE.match(gid):
+                self.problem("%s: id must be 1 to 20 letters, digits, - or _" % where)
+            elif gid in seen:
+                self.problem("%s: id %s is used twice" % (where, gid))
+            else:
+                seen.add(gid)
+                where = "group %s" % gid
+            for key in sorted(set(g) - GROUP_KEYS):
+                self.problem("%s: unknown field %r" % (where, key))
+            self.string("%s title" % where, g.get("title"), "title")
+            self.string("%s intent" % where, g.get("intent"), "intent")
+            self.string("%s why" % where, g.get("why"), "why")
+            self.string("%s tests_note" % where, g.get("tests_note", ""), "tests_note", required=False)
+            risk = g.get("risk")
+            if risk not in RISKS:
+                self.problem("%s: risk must be high, medium or low" % where)
+                risk = None
+            tests = g.get("tests")
+            if tests not in TEST_STATUSES:
+                self.problem("%s: tests must be one of %s" % (where, ", ".join(TEST_STATUSES)))
+            ids = self.unit_list("%s units" % where, g.get("units"))
+            if not g.get("units"):
+                self.problem("%s has no units" % where)
+            for uid in ids:
+                assigned.setdefault(uid, []).append(where)
+                u = self.units[uid]
+                if u["kind"] == "file" and not u["required"] and any(
+                        v["file"] == u["file"] and v["kind"] == "hunk" for v in self.facts["units"]):
+                    self.problem("%s: %s is a whole-file unit of a file with hunks; list its hunks instead" % (where, uid))
+            if risk:
+                rank = RISK_RANK[risk]
+                if last_rank is not None and rank > last_rank:
+                    self.problem("%s is %s but comes after a lower-risk group; order groups high to low" % (where, risk))
+                last_rank = rank if last_rank is None else min(last_rank, rank)
+            hard = self.hard_flags(ids)
+            if hard and risk != "high":
+                self.problem("%s holds hard-flagged units (%s) and must be high risk" % (where, ", ".join(sorted(hard))))
+            evidence = g.get("evidence", [])
+            if not isinstance(evidence, list):
+                self.problem("%s: evidence must be a list" % where)
+                evidence = []
+            group_files = sorted(set(self.units[uid]["file"] for uid in ids))
+            cited = [self.citation(where, e, allowed_units=set(ids), allowed_files=set(group_files)) for e in evidence]
+            cited_files = set(c["file"] for c in cited if c)
+            changed_cited = set(c["file"] for c in cited if c and c["kind"] == "unit")
+            if risk in ("high", "medium") and not evidence:
+                self.problem("%s is %s risk but cites no evidence" % (where, risk))
+            if risk == "high":
+                missing = [i for i in group_files if i not in changed_cited]
+                if missing:
+                    self.problem("%s is high risk; cite at least one changed line (a unit citation) in each of "
+                                 "its files (missing: %s)" % (where, ", ".join(self.file_label(i) for i in missing[:5])))
+            if risk == "medium" and evidence:
+                need = min(3, len(group_files))
+                if len(changed_cited) < need:
+                    self.problem("%s is medium risk; cite lines in at least %d of its files" % (where, need))
+            tests_ev = g.get("tests_evidence", [])
+            if not isinstance(tests_ev, list):
+                self.problem("%s: tests_evidence must be a list" % where)
+                tests_ev = []
+            tcited = [self.test_citation("%s tests_evidence" % where, e) for e in tests_ev]
+            is_test = lambda c: c["kind"] == "path" or self.files[c["file"]]["class"] == "test"
+            for c in tcited:
+                if c and (c["side"] != "+" or not is_test(c)):
+                    self.problem("%s tests_evidence must cite head lines (+N) of test files" % where)
+                    break
+            if tests in ("covered", "partial") and not any(c and c["side"] == "+" and is_test(c) for c in tcited):
+                self.problem("%s says tests %s; put at least one head line of a test file that exercises it in "
+                             "tests_evidence (a test unit, F:+N, or PATH:+N for an unchanged test file)" % (where, tests))
+            code_units = [u for u in ids if self.units[u]["kind"] == "hunk"
+                          and self.files[self.units[u]["file"]]["class"] == "source"
+                          and not comment_only(self.units[u], self.files[self.units[u]["file"]]["path"] or "")]
+            if tests == "n/a" and code_units:
+                self.problem("%s changes source code, so tests cannot be n/a; use none, partial or covered" % where)
+            valid.append((g, ids))
+        return valid
+
+    def file_label(self, index):
+        f = self.files[index]
+        return "%d %s" % (index, clean_line(f["path"] or f["old_path"]))
+
+    def check_not_examined(self, assigned):
+        ne = self.brief.get("not_examined", {"units": [], "reason": ""})
+        if not isinstance(ne, dict) or set(ne) - set(["units", "reason"]):
+            self.problem("not_examined must be {\"units\": [...], \"reason\": \"...\"}")
+            return
+        ids = self.unit_list("not_examined units", ne.get("units", []))
+        for uid in ids:
+            assigned.setdefault(uid, []).append("not_examined")
+        hard = [uid for uid in ids if self.hard_flags([uid])]
+        if hard:
+            self.problem("hard-flagged units cannot go to not_examined: %s" % ", ".join(hard[:8]))
+        self.string("not_examined reason", ne.get("reason", ""), "reason", required=bool(ids))
+
+    def check_coverage(self, assigned):
+        missing = [u["id"] for u in self.facts["units"] if u["required"] and u["id"] not in assigned]
+        if missing:
+            self.problem("%d unit%s not assigned: %s" % (
+                len(missing), "" if len(missing) == 1 else "s",
+                ", ".join(missing[:12]) + (" ..." if len(missing) > 12 else "")))
+        for uid, places in sorted(assigned.items()):
+            if len(places) > 1:
+                self.problem("unit %s is assigned more than once (%s)" % (uid, ", ".join(places)))
+
+    def check_share(self, groups):
+        t = self.facts["totals"]
+        if t["review_lines"] < SHARE_MIN_LINES or t["review_files"] < SHARE_MIN_FILES:
+            return
+        allow = self.brief.get("allow_large_group")
+        if isinstance(allow, str) and allow.strip():
+            return
+        for g, ids in groups:
+            lines = sum(self.units[u].get("lines_counted", self.units[u]["added"] + self.units[u]["removed"])
+                        for u in ids if self.units[u]["required"])
+            if lines > SHARE_MAX * t["review_lines"]:
+                self.problem("group %s holds %d of %d lines to review; split it by concern, or say why it is "
+                             "one concern in allow_large_group" % (g.get("id"), lines, t["review_lines"]))
+
+    def check_undisclosed(self):
+        items = self.brief.get("undisclosed", [])
+        if not isinstance(items, list):
+            self.problem("undisclosed must be a list")
+            return
+        if len(items) > MAX_UNDISCLOSED:
+            self.problem("%d undisclosed items; the limit is %d" % (len(items), MAX_UNDISCLOSED))
+        for n, item in enumerate(items, 1):
+            if not isinstance(item, dict) or set(item) - set(["text", "units"]):
+                self.problem("undisclosed %d must be {\"text\": ..., \"units\": [...]}" % n)
+                continue
+            self.string("undisclosed %d" % n, item.get("text"), "undisclosed")
+            if not self.unit_list("undisclosed %d units" % n, item.get("units")):
+                self.problem("undisclosed %d names no units" % n)
+
+
+def check_brief(path, target, allow_merged=False):
+    """Recompute the facts for a brief and validate it. Returns (facts, brief, problems)."""
+    brief = load_json_file(path, "brief")
+    if not isinstance(brief, dict):
+        die("brief %s is not a JSON object" % path)
+    ctx, problems = context_from_brief(brief, target, allow_merged)
+    if problems:
+        return None, brief, problems
+    facts = compute_facts(ctx)
+    return facts, brief, Checker(facts, brief).run()
+
+
+def print_problems(problems, lead):
+    print("%s, %d problem%s:" % (lead, len(problems), "" if len(problems) == 1 else "s"))
+    for p in problems:
+        print("  - " + clean_line(p))
+
+
+def target_args(args):
+    if getattr(args, "base", None):
+        return "--base %s" % shlex.quote(args.base) + (" --head %s" % shlex.quote(args.head) if args.head else "")
+    out = []
+    if args.pr:
+        out.append(shlex.quote(args.pr))
+    if args.repo:
+        out.append("--repo %s" % shlex.quote(args.repo))
+    return " ".join(out)
+
+
+def cmd_check(args):
+    facts, brief, problems = check_brief(args.brief, resolve_target(args), args.allow_merged)
+    if problems:
+        print_problems(problems, "brief refused")
+        return 1
+    groups = brief.get("groups") or []
+    ne = len((brief.get("not_examined") or {}).get("units") or [])
+    print("brief OK: %d group%s, %d unit%s assigned%s" % (
+        len(groups), "" if len(groups) == 1 else "s",
+        facts["totals"]["required_units"] - ne, "" if facts["totals"]["required_units"] - ne == 1 else "s",
+        (", %d not examined" % ne) if ne else ""))
+    print("next:  %s render %s %s%s" % (command_name(), shlex.quote(args.brief), target_args(args),
+                                         " --allow-merged" if args.allow_merged else ""))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# render
+#
+# Only the CLI writes section labels. Text written by the agent, and text taken from the
+# PR, is printed on lines that start with a fixed prefix, with every hidden character
+# escaped; in markdown it is also escaped so it cannot add headings, links, images, HTML
+# or mentions.
+
+MD_SPECIAL = re.compile(r"([\\*_\[\]<>!#|~&`:])")
+MD_AUTOLINK = re.compile(
+    r"[A-Za-z][A-Za-z0-9+.-]*://\S+|www\.\S+|[^\s@]*@[^\s@]*|"
+    r"(?:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#\d+\b|\bGH-\d+\b|\b[0-9a-fA-F]{7,40}\b")
+
+
+def md_code(s):
+    s = clean_line(s)
+    longest = max([len(r) for r in re.findall(r"`+", s)] or [0])
+    fence = "`" * (longest + 1)
+    pad = " " if longest else ""
+    return "%s%s%s%s%s" % (fence, pad, s, pad, fence)
+
+
+def md_text(s):
+    """Escape third-party or agent text for markdown. Every backtick is escaped, so no code
+    span can open; URLs, mentions, issue references and commit ids become code spans of
+    their own so they neither link, notify nor cross-reference."""
+    s = clean_line(s)
+    out, pos = [], 0
+    esc = lambda t: MD_SPECIAL.sub(r"\\\1", t).replace("$", "<span>$</span>")
+    for m in MD_AUTOLINK.finditer(s):
+        out.append(esc(s[pos:m.start()]))
+        out.append(md_code(m.group(0)))
+        pos = m.end()
+    out.append(esc(s[pos:]))
+    joined = "".join(out)
+    joined = re.sub(r"^(\s*)(\d+)([.)])", r"\1\2\\\3", joined)
+    return re.sub(r"^(\s*)([-+=])", r"\1\\\2", joined)
+
+
+class Renderer(object):
+    def __init__(self, facts, brief, fmt):
+        self.facts, self.brief, self.md = facts, brief, fmt == "md"
+        self.units = dict((u["id"], u) for u in facts["units"])
+        self.files = dict((f["index"], f) for f in facts["files"])
+        self.lines = []
+        names = {}
+        for f in facts["files"]:
+            p = f["path"] or f["old_path"]
+            names.setdefault(os.path.basename(p), []).append(p)
+        self.short = dict((f["index"], os.path.basename(f["path"] or f["old_path"])
+                           if len(names[os.path.basename(f["path"] or f["old_path"])]) == 1
+                           else (f["path"] or f["old_path"])) for f in facts["files"])
+        self.group_of = {}
+        for g in brief.get("groups") or []:
+            for uid in g.get("units") or []:
+                self.group_of[uid] = g
+
+    def out(self, s=""):
+        self.lines.append(s)
+
+    def section(self, title, source):
+        if self.md:
+            self.out("")
+            self.out("### %s _(%s)_" % (title, source))
+            self.out("")
+        else:
+            self.out("")
+            self.out("%s [%s]" % (title.upper(), source))
+
+    def ai(self, s, indent="  "):
+        """A line of agent- or PR-written text."""
+        if self.md:
+            self.out("> " + md_text(s))
+            self.out("")
+        else:
+            self.out("%s| %s" % (indent, clean_line(s)))
+
+    def path_of(self, index):
+        f = self.files[index]
+        return f["path"] or f["old_path"]
+
+    def code(self, s):
+        return md_code(s) if self.md else clean_line(s)
+
+    def where(self, uid):
+        u = self.units[uid]
+        p = self.path_of(u["file"])
+        if u["kind"] == "file":
+            return p
+        if u["head"]:
+            return "%s:+%d-%d" % (p, u["head"][0], u["head"][1])
+        return "%s:-%d-%d" % (p, u["base"][0], u["base"][1])
+
+    def cite(self, c):
+        pmatch = PATH_CITE_RE.match(c) if not FILE_CITE_RE.match(c) and not CITE_RE.match(c) else None
+        if pmatch:
+            label = clean_line(pmatch.group(1)) + ":+" + pmatch.group(2)
+            pr = self.facts.get("pr")
+            if self.md and pr:
+                base = pr["url"].split("/pull/")[0]
+                quoted = "/".join(urllib.parse.quote(part) for part in pmatch.group(1).split("/"))
+                url = "%s/blob/%s/%s#L%s" % (base, self.facts["head"], quoted, pmatch.group(2))
+                return "[%s](%s)" % (md_text(label), url)
+            return md_text(label) if self.md else label
+        fmatch = FILE_CITE_RE.match(c)
+        if fmatch:
+            index, side, n = int(fmatch.group(1)), fmatch.group(2), fmatch.group(3)
+        else:
+            match = CITE_RE.match(c)
+            uid, side, n = match.group(1), match.group(2), match.group(3)
+            index = self.units[uid]["file"]
+        label = clean_line(self.short[index]) + ((":%s%s" % (side, n)) if side else "")
+        pr = self.facts.get("pr")
+        if self.md and pr and side:
+            f = self.files[index]
+            anchor_path = f["path"] if side == "+" else (f["old_path"] or f["path"])
+            digest = hashlib.sha256(anchor_path.encode("utf-8", "surrogateescape")).hexdigest()
+            url = "%s/files#diff-%s%s%s" % (pr["url"], digest, "R" if side == "+" else "L", n)
+            return "[%s](%s)" % (md_text(label), url)
+        return md_text(label) if self.md else label
+
+    def bullet(self, s):
+        self.out(("- " if self.md else "  - ") + s)
+
+    def render(self):
+        f, b = self.facts, self.brief
+        t = f["totals"]
+        pr = f["pr"]
+        if self.md:
+            self.out("## yog review brief")
+            self.out("")
+        else:
+            self.out("YOG REVIEW BRIEF")
+        if pr:
+            title = md_text(pr["title"]) if self.md else clean_line(pr["title"])
+            self.out("%s/%s#%d: %s" % (pr["owner"], pr["repo"], pr["number"], title))
+            if self.md:
+                self.out("")
+            self.out("head %s, base %s at %s, merge base %s; checked against the live PR when rendered" % (
+                f["head"][:12], clean_line(pr.get("base_ref") or "?"), f["base_tip"][:12], f["merge_base"][:12]))
+        else:
+            self.out("LOCAL COMMITS, not a PR: base %s, merge base %s, head %s" % (
+                f["base_tip"][:12], f["merge_base"][:12], f["head"][:12]))
+        if self.md:
+            self.out("")
+        self.out("%d files, +%d -%d. %d lines in %d files need review; %d files are mechanical." % (
+            t["files"], t["added"], t["removed"], t["review_lines"], t["review_files"], t["mechanical_files"]))
+        if t["large"]:
+            if self.md:
+                self.out("")
+            self.out("LARGE PR: the groups below are a proposed split.")
+        self.out("Sections marked computed come from git. Sections marked AI were written by an agent "
+                 "and checked only for coverage, citations and length.")
+        self.start_here()
+        self.hard_flags()
+        self.not_examined()
+        self.section("Summary", "AI")
+        self.ai(b.get("summary", ""))
+        self.claims()
+        self.undisclosed()
+        self.groups()
+        self.mechanical()
+        self.dependencies()
+        questions = b.get("questions") or []
+        if questions:
+            self.section("Questions for the author", "AI")
+            for q in questions:
+                self.ai(q)
+        return "\n".join(self.lines).rstrip() + "\n"
+
+    def start_here(self):
+        picks = []
+        hard_count = lambda u: sum(1 for c in u["flags"] if FLAGS[c][0] == "hard")
+        minor = lambda u: 1 if self.files[u["file"]]["class"] in ("test", "docs") else 0
+        for g in self.brief.get("groups") or []:
+            if g.get("risk") not in ("high", "medium"):
+                continue
+            cands = [self.units[uid] for uid in g.get("units") or [] if uid in self.units and self.units[uid]["required"]]
+            if not cands:
+                continue
+            cands.sort(key=lambda u: (-hard_count(u), minor(u), -(u["added"] + u["removed"]), u["id"]))
+            picks.append((g, cands[0]))
+        if not picks:
+            return
+        self.section("Start here", "computed: the hardest-flagged or largest unit of each high and medium group")
+        for n, (g, u) in enumerate(picks[:5], 1):
+            hard = [c for c in u["flags"] if FLAGS[c][0] == "hard"]
+            flags = (" hard flags: " + ", ".join(hard)) if hard else ""
+            self.out(("%d. " if self.md else "  %d. ") % n + "%s %s, group %s (%s)%s" % (
+                u["id"], self.code(self.where(u["id"])), clean_line(str(g.get("id"))), g.get("risk"), flags))
+        if len(picks) > 5:
+            self.out("%d more groups below." % (len(picks) - 5))
+
+    def hard_flags(self):
+        hard = [e for e in self.facts["flags"] if e["tier"] == "hard"]
+        pr_level = [e for e in self.facts["flags"] if e["file"] is None]
+        self.section("Hard flags", "computed")
+        if not hard and not pr_level:
+            self.out("none" if not self.md else "None.")
+            return
+        for e in hard + [e for e in pr_level if e["tier"] != "hard"]:
+            target = self.code(self.path_of(e["file"])) if e["file"] else "PR text"
+            details = ("; " + "; ".join(clean_line(d) for d in e["details"])) if e["details"] else ""
+            if self.md:
+                details = md_text(details) if details else ""
+            self.bullet("%s: %s, %s (units %s)%s" % (
+                e["code"], e["title"], target, ", ".join(e["units"][:6]) + (" ..." if len(e["units"]) > 6 else ""),
+                details))
+
+    def not_examined(self):
+        ne = self.brief.get("not_examined") or {}
+        ids = ne.get("units") or []
+        if not ids:
+            return
+        lines = sum(self.units[u]["added"] + self.units[u]["removed"] for u in ids)
+        self.section("Not examined", "computed")
+        self.out("%d units, %d changed lines, were not read by the agent: %s" % (
+            len(ids), lines, ", ".join(ids[:20]) + (" ..." if len(ids) > 20 else "")))
+        self.ai("reason: " + ne.get("reason", ""))
+
+    def claims(self):
+        claims = self.facts["claims"]
+        if not claims:
+            return
+        answers = self.brief.get("claims") or {}
+        order = {"contradicted": 0, "partial": 1, "not_found": 2, "matches": 3, "not_a_claim": 4}
+        status = lambda c: (answers.get(c["id"]) or {}).get("status") or "?"
+        self.section("Claims in the PR, problems first", "claims from the PR text, answers by AI")
+        skipped = [c["id"] for c in claims if status(c) == "not_a_claim"]
+        for c in sorted(claims, key=lambda c: (order.get(status(c), 5), int(c["id"][1:]))):
+            if status(c) == "not_a_claim":
+                continue
+            a = answers.get(c["id"]) or {}
+            ev = ", ".join(self.cite(e) for e in (a.get("evidence") or []))
+            if self.md:
+                line = "- **%s %s** %s" % (c["id"], status(c).upper(), md_text(c["text"]))
+                self.out(line + ((" (" + ev + ")") if ev else ""))
+                if a.get("note"):
+                    self.out("  - " + md_text(a["note"]))
+            else:
+                self.out("  %-4s %-12s %s%s" % (c["id"], status(c).upper(), clean_line(c["text"]),
+                                                ("  [" + ev + "]") if ev else ""))
+                if a.get("note"):
+                    self.out("                    | " + clean_line(a["note"]))
+        if skipped:
+            self.out(("" if self.md else "  ") + "Judged not to be claims: %s." % ", ".join(skipped))
+        if self.facts.get("claims_dropped"):
+            self.out("%d more sentences in the PR text were not extracted." % self.facts["claims_dropped"])
+
+    def undisclosed(self):
+        items = self.brief.get("undisclosed") or []
+        if not items:
+            return
+        self.section("Changes the PR text does not mention", "AI")
+        for item in items:
+            self.ai("%s (units %s)" % (item.get("text", ""), ", ".join(item.get("units") or [])))
+
+    def groups(self):
+        groups = self.brief.get("groups") or []
+        if not groups:
+            return
+        self.section("Groups, highest risk first", "computed stats, then AI")
+        for g in groups:
+            ids = g.get("units") or []
+            files = sorted(set(self.units[u]["file"] for u in ids))
+            added = sum(self.units[u]["added"] for u in ids)
+            removed = sum(self.units[u]["removed"] for u in ids)
+            hard = sorted(set(c for u in ids for c in self.units[u]["flags"] if FLAGS[c][0] == "hard"))
+            hints = sorted(set(c for u in ids for c in self.units[u]["flags"] if FLAGS[c][0] == "hint"))
+            unpaired = len([i for i in files if (self.files[i].get("pairing") or {}).get("status") == "none"])
+            test_files = len([i for i in files if self.files[i]["class"] == "test"])
+            head = "group %s, %s risk" % (clean_line(str(g.get("id"))), clean_line(str(g.get("risk"))).upper())
+            if self.md:
+                self.out("")
+                self.out("#### " + head)
+                self.out("")
+            else:
+                self.out("")
+                self.out("  " + head)
+            stats = "%d file%s, +%d -%d" % (len(files), "" if len(files) == 1 else "s", added, removed)
+            if hard:
+                stats += "; hard flags: " + ", ".join(hard)
+            if hints:
+                stats += "; hints: " + ", ".join(hints)
+            if unpaired:
+                stats += "; %d source file%s with no test file named after %s" % (
+                    unpaired, "" if unpaired == 1 else "s", "it" if unpaired == 1 else "them")
+            if test_files:
+                stats += "; %d test file%s in this group" % (test_files, "" if test_files == 1 else "s")
+            self.out(("computed: " if self.md else "    computed: ") + stats)
+            if self.md:
+                self.out("")
+            names = ", ".join(self.code(self.path_of(i)) for i in files[:8]) + (" ..." if len(files) > 8 else "")
+            self.out(("files: " if self.md else "    files: ") + names)
+            if self.md:
+                self.out("")
+            self.ai("title: " + g.get("title", ""), "    ")
+            self.ai("intent: " + g.get("intent", ""), "    ")
+            self.ai("why: " + g.get("why", ""), "    ")
+            ev = g.get("evidence") or []
+            if ev:
+                self.out(("evidence: " if self.md else "    evidence: ") + ", ".join(self.cite(e) for e in ev))
+                if self.md:
+                    self.out("")
+            tests = "tests: %s" % g.get("tests")
+            if g.get("tests_note"):
+                tests += ", " + g["tests_note"]
+            self.ai(tests, "    ")
+            tev = g.get("tests_evidence") or []
+            if tev:
+                self.out(("tests evidence: " if self.md else "    tests evidence: ") + ", ".join(self.cite(e) for e in tev))
+                if self.md:
+                    self.out("")
+            self.out(("units: " if self.md else "    units: ") + " ".join(ids))
+
+    def mechanical(self):
+        mech = [f for f in self.facts["files"] if f["mechanical"]]
+        if not mech:
+            return
+        self.section("Mechanical files, not in any group", "computed")
+        for f in mech:
+            self.bullet("%s, %s, +%d -%d" % (self.code(f["path"] or f["old_path"]), f["mechanical"], f["added"], f["removed"]))
+
+    def dependencies(self):
+        rows = []
+        for f in self.facts["files"]:
+            for d in f.get("deps") or []:
+                rows.append("%s: %s" % (self.code(f["path"] or f["old_path"]), md_text(d) if self.md else d))
+            if f.get("lock"):
+                l = f["lock"]
+                rows.append("%s: %d added, %d removed, %d version changes" % (
+                    self.code(f["path"]), l["added"], l["removed"], l["changed"]))
+        if not rows:
+            return
+        self.section("Dependencies", "computed")
+        for r in rows[:40]:
+            self.bullet(r)
+        if len(rows) > 40:
+            self.out("%d more" % (len(rows) - 40))
+
+
+def cmd_render(args):
+    facts, brief, problems = check_brief(args.brief, resolve_target(args), args.allow_merged)
+    if problems:
+        print_problems(problems, "brief refused; fix these, then render")
+        return 1
+    sys.stdout.write(Renderer(facts, brief, args.format).render())
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# facts, hunks, show
+
+def facts_from_file(path):
+    data = load_json_file(path, "facts")
+    if not isinstance(data, dict) or not all(
+            isinstance(data.get(k), str) and SHA_RE.match(data[k]) for k in ("base_tip", "merge_base", "head")):
+        die("%s is not a yog facts file" % path)
+    for k in ("base_tip", "merge_base", "head"):
+        if not has_commit(data[k]):
+            die("commit %s from %s is not in this repository; run collect again" % (data[k][:12], path))
+    pr = data.get("pr")
+    if pr is not None:
+        ok = isinstance(pr, dict) and all(isinstance(pr.get(k), str) for k in ("owner", "repo", "title", "url"))
+        ok = ok and isinstance(pr.get("number"), int) and isinstance(pr.get("commit_subjects", []), list)
+        if not ok:
+            die("%s is not a yog facts file (bad pr field)" % path)
+        pr = dict(pr, commit_subjects=[str(x) for x in pr.get("commit_subjects") or []])
+    ctx = {"mode": "pr" if pr else "local", "base_tip": data["base_tip"], "merge_base": data["merge_base"],
+           "head": data["head"], "pr": None, "subjects": []}
+    if pr:
+        ctx["pr"] = dict(pr, body="", commit_subjects=pr.get("commit_subjects") or [])
+    return compute_facts(ctx)
+
+
+def cmd_facts(args):
+    facts = facts_from_file(args.facts)
+    if args.format == "json":
+        json.dump(facts_json(facts), sys.stdout, indent=2, ensure_ascii=True)
+        sys.stdout.write("\n")
+        return 0
+    md = args.format == "md"
+    r = Renderer(facts, {"groups": [], "claims": {}}, "md" if md else "term")
+    t = facts["totals"]
+    r.out("## yog facts" if md else "YOG FACTS (computed, no AI)")
+    r.out("%d files, +%d -%d. %d lines in %d files need review; %d files are mechanical." % (
+        t["files"], t["added"], t["removed"], t["review_lines"], t["review_files"], t["mechanical_files"]))
+    r.hard_flags()
+    r.section("Files", "computed")
+    for f in facts["files"]:
+        if f["mechanical"]:
+            continue
+        hints = sorted(set(e["code"] for e in facts["flags"] if e["file"] == f["index"] and e["tier"] == "hint"))
+        bits = [f["class"], f["status"]]
+        if f.get("pairing"):
+            bits.append("test file: " + f["pairing"]["status"])
+        if hints:
+            bits.append("hints: " + ", ".join(hints))
+        r.bullet("%d %s +%d -%d (%s)" % (f["index"], r.code(f["path"] or f["old_path"]), f["added"], f["removed"], "; ".join(bits)))
+    r.mechanical()
+    r.dependencies()
+    sys.stdout.write("\n".join(r.lines).rstrip() + "\n")
+    return 0
+
+
+def select_units(facts, ids):
+    units = facts["units"]
+    if ids == ["all"]:
+        return units
+    out = []
+    ids = [i for raw in ids for i in raw.split(",") if i]
+    for want in ids:
+        if not re.match(r"^\d+(?:\.\d+){0,2}$", want):
+            die("%r is not a unit id (F, F.H or F.H.C, or all)" % want)
+        hit = [u for u in units if u["id"] == want or u["id"].startswith(want + ".")]
+        if not hit:
+            die("no unit %s in this diff" % want)
+        out.extend(u for u in hit if u not in out)
+    return out
+
+
+def cmd_hunks(args):
+    facts = facts_from_file(args.facts)
+    files = dict((f["index"], f) for f in facts["files"])
+    for u in select_units(facts, args.ids):
+        f = files[u["file"]]
+        path = clean_line(f["path"] or f["old_path"])
+        if f["status"] in "RC" and f["old_path"] != f["path"]:
+            path = "%s (from %s)" % (path, clean_line(f["old_path"]))
+        flags = (" flags: " + ", ".join(u["flags"])) if u["flags"] else ""
+        if u["kind"] == "file":
+            print("== %s  %s  [%s %s%s]%s" % (u["id"], path, f["class"], f["status"],
+                                                ", mechanical: " + f["mechanical"] if f["mechanical"] else "", flags))
+            if f.get("link_target"):
+                print("   symlink -> %s" % f["link_target"])
+            if f["class"] == "lockfile" and u["lines"]:
+                print("   lockfile diff, %d lines; first %d shown" % (len(u["lines"]), min(len(u["lines"]), args.max_lines)))
+                lines = u["lines"][:args.max_lines]
+            else:
+                continue
+        else:
+            print("== %s  %s  head %s  base %s%s" % (
+                u["id"], path, "%d-%d" % tuple(u["head"]) if u["head"] else "-",
+                "%d-%d" % tuple(u["base"]) if u["base"] else "-", flags))
+            lines = u["lines"]
+        for kind, old_no, new_no, line in lines:
+            left = ("+%d" % new_no) if kind == "+" else ("-%d" % old_no) if kind == "-" else (" %d" % new_no)
+            print("%7s %s %s" % (left, kind if kind != " " else "|", clean(line)))
+    return 0
+
+
+def cmd_show(args):
+    data = load_json_file(args.facts, "facts")
+    commit = data.get("merge_base") if isinstance(data, dict) and args.base else (data.get("head") if isinstance(data, dict) else None)
+    if not isinstance(commit, str) or not SHA_RE.match(commit) or not has_commit(commit):
+        die("the facts file's commits are not in this repository; run collect again")
+    blob = read_path(commit, args.path)
+    if blob is None:
+        die("%s is not a file at the %s commit %s" % (args.path, "base" if args.base else "head", commit[:12]))
+    if looks_binary(blob):
+        die("%s is binary" % args.path)
+    lines = split_lines(blob)
+    lo, hi = 1, len(lines)
+    if args.lines:
+        match = re.match(r"^(\d+)-(\d+)$", args.lines)
+        if not match:
+            die("--lines must look like A-B")
+        lo, hi = max(1, int(match.group(1))), min(len(lines), int(match.group(2)))
+    for n in range(lo, hi + 1):
+        print("%6d  %s" % (n, clean(lines[n - 1])))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# cli
+
+def build_parser():
+    p = argparse.ArgumentParser(prog=command_name(), description="A review brief for a pull request.")
+    p.add_argument("--version", action="version", version="yog %s" % VERSION)
+    sub = p.add_subparsers(dest="cmd")
+
+    c = sub.add_parser("collect", help="fetch a PR or take local commits; compute facts; write a brief template")
+    c.add_argument("pr", nargs="?", help="PR number or URL (default: the current branch's PR)")
+    c.add_argument("--repo", help="OWNER/NAME when giving a PR number outside its checkout")
+    c.add_argument("--base", help="local mode: base branch or commit")
+    c.add_argument("--head", help="local mode: head commit (default HEAD)")
+    c.add_argument("--allow-merged", action="store_true", help="brief a merged or closed PR (for evaluation)")
+    c.add_argument("--dir", help="where to write facts.json and brief.json (default: inside the git dir)")
+    c.set_defaults(func=cmd_collect)
+
+    c = sub.add_parser("facts", help="print the computed facts, no AI")
+    c.add_argument("facts", help="facts.json written by collect")
+    c.add_argument("-f", "--format", choices=("term", "md", "json"), default="term")
+    c.set_defaults(func=cmd_facts)
+
+    c = sub.add_parser("hunks", help="print units with line numbers")
+    c.add_argument("facts", help="facts.json written by collect")
+    c.add_argument("ids", nargs="+", help="unit ids: F (whole file), F.H, F.H.C, or all")
+    c.add_argument("--max-lines", type=int, default=200, help="lines shown for a lockfile (default 200)")
+    c.set_defaults(func=cmd_hunks)
+
+    c = sub.add_parser("show", help="print a file at the PR's head (or base) with line numbers")
+    c.add_argument("facts", help="facts.json written by collect")
+    c.add_argument("path", help="file path in the repository")
+    c.add_argument("--lines", help="A-B, a line range")
+    c.add_argument("--base", action="store_true", help="the merge base version instead of the head")
+    c.set_defaults(func=cmd_show)
+
+    for name, func, helptext in (("check", cmd_check, "recompute the facts and validate a brief"),
+                                 ("render", cmd_render, "check a brief, then print it")):
+        c = sub.add_parser(name, help=helptext)
+        c.add_argument("brief", help="brief.json")
+        c.add_argument("pr", nargs="?", help="the PR the brief must be for (default: the current branch's PR)")
+        c.add_argument("--repo", help="OWNER/NAME when giving a PR number outside its checkout")
+        c.add_argument("--base", help="local mode: the base the brief must be for")
+        c.add_argument("--head", help="local mode: the head the brief must be for (default HEAD)")
+        c.add_argument("--allow-merged", action="store_true", help="accept a merged or closed PR")
+        if name == "render":
+            c.add_argument("-f", "--format", choices=("term", "md"), default="term")
+        c.set_defaults(func=func)
+    return p
+
+
+def main(argv=None):
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="backslashreplace")
+        except (AttributeError, ValueError):
+            pass
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "func", None):
+        parser.print_help()
+        return 2
+    try:
+        return args.func(args)
+    except YogError as exc:
+        sys.stderr.write("%s: %s\n" % (command_name(), exc))
+        return exc.code
+    except KeyboardInterrupt:
+        sys.stderr.write("interrupted\n")
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
